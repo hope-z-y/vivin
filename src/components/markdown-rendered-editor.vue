@@ -26,6 +26,7 @@ const emit = defineEmits<{
   incompatible: [];
   error: [message: string];
   'annotation-request': [kind: AnnotationKind, selection: { quote: string; offset: number }];
+  'open-reference': [href: string];
 }>();
 
 const container = ref<HTMLDivElement>();
@@ -37,6 +38,16 @@ const ready = new Promise<void>((resolve) => {
   resolveReady = resolve;
 });
 const imageCache = new Map<string, Promise<string>>();
+
+function openLink(event: MouseEvent) {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const link = target.closest<HTMLAnchorElement>('a[href]');
+  if (!link || !container.value?.contains(link)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  emit('open-reference', link.getAttribute('href') ?? '');
+}
 
 async function revealAnnotation(id: string): Promise<boolean> {
   await ready;
@@ -328,7 +339,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="container" class="rendered-editor h-full overflow-auto px-8 py-7" />
+  <div
+    ref="container"
+    class="rendered-editor h-full min-w-0 overflow-auto px-8 py-7"
+    @click.capture="openLink"
+  />
 </template>
 
 <style>
@@ -341,5 +356,33 @@ onBeforeUnmount(() => {
 
 .rendered-editor .milkdown .ProseMirror {
   padding: 60px 8%;
+}
+
+.rendered-editor .milkdown .milkdown-table-block {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.rendered-editor .milkdown .milkdown-table-block .table-wrapper {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+}
+
+.rendered-editor .milkdown .milkdown-table-block table {
+  width: max-content;
+  min-width: 100%;
+  table-layout: auto;
+}
+
+.rendered-editor .milkdown .milkdown-table-block th,
+.rendered-editor .milkdown .milkdown-table-block td {
+  min-width: 170px;
+  max-width: 360px;
+  white-space: normal;
+  overflow-wrap: break-word;
+  vertical-align: top;
 }
 </style>

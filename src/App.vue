@@ -53,6 +53,8 @@ import {
   moveEntry,
   nativeAvailable,
   openProject,
+  openProjectReference,
+  openProjectResource,
   publishDraft,
   readDocument,
   readProjectRules,
@@ -172,6 +174,14 @@ const hoveredTerm = ref<{
   x: number;
   y: number;
 } | null>(null);
+const hoveredTermDetail = computed(() => {
+  const definition = hoveredTerm.value?.term.definition ?? '';
+  const source = definition.match(/^来源：(resources\/[^\r\n]+)$/m)?.[1] ?? null;
+  return {
+    source,
+    body: source ? definition.replace(/^来源：resources\/[^\r\n]+\r?\n?/m, '').trim() : definition,
+  };
+});
 const focusedTermId = ref<string | null>(null);
 const context = ref<TreeNode | null>(null);
 const contextAt = ref({ x: 0, y: 0 });
@@ -305,6 +315,9 @@ const resourceCount = computed(() => {
     );
   return countFiles(resources.value);
 });
+const hoverTerms = computed(() =>
+  [...data.value.terms].sort((a, b) => b.name.length - a.name.length),
+);
 const dirty = computed(() =>
   Object.values(docs.value).some((doc) => doc.content !== doc.savedContent),
 );
@@ -489,6 +502,27 @@ async function openDoc(path: string, paneIndex = activePane.value) {
     report(error);
   } finally {
     if (paneRequestIds.get(paneIndex) === requestId) loadingPanes.value.delete(paneIndex);
+  }
+}
+
+async function openReference(sourceDocument: string, href: string) {
+  try {
+    const result = await openProjectReference(sourceDocument, decodeURIComponent(href));
+    if (result.kind !== 'document' || !result.path) return;
+    const createdSplit = panes.value.length === 1;
+    if (createdSplit) toggleSplit();
+    await openDoc(result.path, 1);
+    if (createdSplit && panes.value[1]?.path === result.path) panes.value[1].mode = 'rendered';
+  } catch (error) {
+    report(error);
+  }
+}
+
+async function openResource(path: string) {
+  try {
+    await openProjectResource(path);
+  } catch (error) {
+    report(error);
   }
 }
 
@@ -935,8 +969,7 @@ function showTermHover(event: MouseEvent, pane: Pane) {
     return;
   }
   const text = node.textContent;
-  const terms = [...data.value.terms].sort((a, b) => b.name.length - a.name.length);
-  for (const term of terms) {
+  for (const term of hoverTerms.value) {
     let start = text.indexOf(term.name);
     while (start >= 0) {
       if (range.startOffset >= start && range.startOffset <= start + term.name.length) {
@@ -962,8 +995,8 @@ function showTermHover(event: MouseEvent, pane: Pane) {
           term,
           document: pane.path,
           offset,
-          x: Math.min(event.clientX + 12, window.innerWidth - 280),
-          y: Math.min(event.clientY + 16, window.innerHeight - 160),
+          x: Math.max(12, Math.min(event.clientX + 12, window.innerWidth - 432)),
+          y: Math.max(12, Math.min(event.clientY + 16, window.innerHeight - 420)),
         };
         return;
       }
@@ -1674,14 +1707,24 @@ onBeforeUnmount(() => {
                   <Folder :size="15" class="shrink-0 text-blue-600" />
                   <span class="truncate">{{ row.node.name }}</span>
                 </button>
-                <template v-else>
+                <button
+                  v-else
+                  class="flex min-w-0 flex-1 items-center gap-1 text-left"
+                  :title="
+                    translate(
+                      `使用系统默认程序打开 ${row.node.name}`,
+                      `Open ${row.node.name} with the default app`,
+                    )
+                  "
+                  @click.stop="openResource(row.node.path)"
+                >
                   <span class="w-3" />
                   <FileText :size="15" class="shrink-0" />
                   <span class="min-w-0 flex-1 truncate" :title="row.node.localPath">
                     {{ row.node.name }}
                   </span>
                   <span class="pr-2 text-[10px] text-slate-400">{{ row.node.fileType }}</span>
-                </template>
+                </button>
               </div>
             </div>
           </div>
@@ -1826,6 +1869,7 @@ onBeforeUnmount(() => {
                       class="min-w-0 flex-1"
                       @update:model-value="setContent(pane.path!, $event)"
                       @error="message = $event"
+                      @open-reference="openReference(pane.path!, $event)"
                       @annotation-request="
                         (kind, selected) => {
                           activePane = index;
@@ -2278,15 +2322,26 @@ onBeforeUnmount(() => {
     </div>
     <div
       v-if="hoveredTerm"
-      class="fixed z-40 w-64 rounded-xl bg-white p-3 text-sm shadow-xl"
+      class="fixed z-40 flex max-h-[min(420px,calc(100vh-24px))] w-[420px] max-w-[calc(100vw-24px)] flex-col overflow-hidden rounded-xl bg-white p-3 text-sm shadow-xl"
       :style="{ left: `${hoveredTerm.x}px`, top: `${hoveredTerm.y}px` }"
       @mouseenter="keepTerm"
       @mouseleave="scheduleHideTerm"
       @click.stop
     >
-      <div class="font-semibold">{{ hoveredTerm.term.name }}</div>
-      <p class="mt-1 whitespace-pre-wrap text-xs leading-5 text-slate-600">
-        {{ hoveredTerm.term.definition }}
+      <div class="shrink-0 break-words font-semibold">{{ hoveredTerm.term.name }}</div>
+      <button
+        v-if="hoveredTermDetail.source"
+        class="mt-1 shrink-0 break-all text-left text-xs leading-5 text-blue-600 hover:underline"
+        :title="translate('使用系统默认程序打开原件', 'Open the original with the default app')"
+        @click="openResource(hoveredTermDetail.source)"
+      >
+        {{ translate('打开原件：', 'Open source: ')
+        }}{{ hoveredTermDetail.source.split('/').pop() }}
+      </button>
+      <p
+        class="mt-1 min-h-0 overflow-x-hidden overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-slate-600 [overflow-wrap:anywhere]"
+      >
+        {{ hoveredTermDetail.body }}
       </p>
       <div class="mt-3 flex gap-3 text-xs text-blue-600">
         <button @click.stop="viewTerm(hoveredTerm!.term)">

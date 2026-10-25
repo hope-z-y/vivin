@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use tauri::State;
+use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -68,6 +69,90 @@ pub struct ResourceNode {
     kind: &'static str,
     file_type: String,
     children: Vec<ResourceNode>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenReferenceResult {
+    kind: &'static str,
+    path: Option<String>,
+}
+
+#[tauri::command]
+pub fn open_project_reference(
+    source_document: String,
+    target: String,
+    state: State<'_, ProjectSession>,
+    app: tauri::AppHandle,
+) -> Result<OpenReferenceResult, String> {
+    let root = state.root()?;
+    let target = target.trim();
+    if target.is_empty() || target.starts_with('#') {
+        return Err("引用缺少可打开的文件路径".to_string());
+    }
+    if target.starts_with("https://") || target.starts_with("http://") {
+        app.opener()
+            .open_url(target, None::<&str>)
+            .map_err(|error| error.to_string())?;
+        return Ok(OpenReferenceResult {
+            kind: "external",
+            path: None,
+        });
+    }
+    if target.contains("://") || target.starts_with("javascript:") {
+        return Err("不支持的引用地址".to_string());
+    }
+    let source = checked_document(&root, &source_document)?;
+    let file_path = target.split(['#', '?']).next().unwrap_or_default();
+    let candidate = source
+        .parent()
+        .ok_or_else(|| "文档路径无效".to_string())?
+        .join(file_path);
+    let canonical = fs::canonicalize(candidate).map_err(|error| error.to_string())?;
+    if !canonical.starts_with(&root) || !canonical.is_file() {
+        return Err("引用文件不在当前项目内".to_string());
+    }
+    let relative = relative_key(&root, &canonical)?;
+    let is_project_document = canonical
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        && !relative.starts_with("resources/")
+        && relative != "AGENTS.md";
+    if is_project_document {
+        checked_document(&root, &relative)?;
+        Ok(OpenReferenceResult {
+            kind: "document",
+            path: Some(relative),
+        })
+    } else {
+        app.opener()
+            .open_path(canonical.to_string_lossy(), None::<&str>)
+            .map_err(|error| error.to_string())?;
+        Ok(OpenReferenceResult {
+            kind: "external",
+            path: None,
+        })
+    }
+}
+
+#[tauri::command]
+pub fn open_project_resource(
+    path: String,
+    state: State<'_, ProjectSession>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let root = state.root()?;
+    let relative = checked_relative(&path)?;
+    if !path.starts_with("resources/") {
+        return Err("只能打开资源库文件".to_string());
+    }
+    let canonical = fs::canonicalize(root.join(relative)).map_err(|error| error.to_string())?;
+    if !canonical.starts_with(&root) || !canonical.is_file() {
+        return Err("资源文件不在当前项目内".to_string());
+    }
+    app.opener()
+        .open_path(canonical.to_string_lossy(), None::<&str>)
+        .map_err(|error| error.to_string())
 }
 
 impl ProjectSession {

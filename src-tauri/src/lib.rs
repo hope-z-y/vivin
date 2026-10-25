@@ -7,6 +7,7 @@ mod project;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(project::ProjectSession::default())
         .setup(|app| {
             ai::start(app.handle().clone()).map_err(std::io::Error::other)?;
@@ -32,6 +33,8 @@ pub fn run() {
             project::delete_annotation,
             project::search_documents,
             project::list_resources,
+            project::open_project_reference,
+            project::open_project_resource,
             project::import_resource,
             project::import_image,
             project::read_project_image,

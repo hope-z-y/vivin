@@ -208,6 +208,17 @@ export function listResources(): Promise<ResourceNode[]> {
   return invoke<ResourceNode[]>('list_resources');
 }
 
+export function openProjectReference(
+  sourceDocument: string,
+  target: string,
+): Promise<{ kind: 'document' | 'external'; path: string | null }> {
+  return invoke('open_project_reference', { sourceDocument, target });
+}
+
+export function openProjectResource(path: string): Promise<void> {
+  return invoke('open_project_resource', { path });
+}
+
 export async function importResource(directory = ''): Promise<string | null> {
   const source = await open({ multiple: false, title: '选择要加入资源库的文件' });
   if (!source || typeof source !== 'string') return null;

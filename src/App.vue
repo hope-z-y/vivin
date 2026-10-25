@@ -1,8 +1,2416 @@
+<script setup lang="ts">
+import {
+  Bookmark,
+  ChevronDown,
+  ChevronRight,
+  FilePlus2,
+  FileText,
+  Folder,
+  Languages,
+  LoaderCircle,
+  LockKeyhole,
+  Moon,
+  MoreHorizontal,
+  PanelLeft,
+  PanelsTopLeft,
+  Pencil,
+  Plus,
+  Save,
+  Search,
+  Sun,
+  Trash2,
+  X,
+} from '@lucide/vue';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import {
+  computed,
+  defineAsyncComponent,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+} from 'vue';
+import AppTitlebar from './components/app-titlebar.vue';
+import EmptyPanel from './components/empty-panel.vue';
+import LoadingState from './components/loading-state.vue';
+import { annotationMarks, resolveAnnotation } from './lib/annotation-anchor';
+import {
+  bridgeInfo,
+  chooseProject,
+  createDirectory,
+  createDocument,
+  createProject,
+  deleteAnnotation,
+  deleteEntry,
+  deleteTerm,
+  errorMessage,
+  getProjectData,
+  listHistory,
+  listProjectTree,
+  listResources,
+  moveEntry,
+  nativeAvailable,
+  openProject,
+  publishDraft,
+  readDocument,
+  readProjectRules,
+  saveDocument,
+  saveProjectRules,
+  searchDocuments,
+  setDirtyDraft,
+  setLocked,
+  setPinned,
+  setTermException,
+  undoChange,
+  upsertAnnotation,
+  upsertTerm,
+  type Annotation,
+  type AnnotationKind,
+  type Document,
+  type HistoryEntry,
+  type ProjectData,
+  type ProjectInfo,
+  type ResourceNode,
+  type SearchHit,
+  type Term,
+  type TermException,
+  type TreeNode,
+} from './lib/project-api';
+const MarkdownRenderedEditor = defineAsyncComponent({
+  loader: () => import('./components/markdown-rendered-editor.vue'),
+  loadingComponent: LoadingState,
+  delay: 0,
+});
+const MarkdownSourceEditor = defineAsyncComponent({
+  loader: () => import('./components/markdown-source-editor.vue'),
+  loadingComponent: LoadingState,
+  delay: 0,
+});
+
+type Mode = 'source' | 'rendered';
+type SidePanel = 'none' | 'search' | 'terms' | 'annotations' | 'history';
+interface DocState extends Document {
+  savedContent: string;
+  conflict: boolean;
+  saving: boolean;
+}
+interface Pane {
+  path: string | null;
+  mode: Mode;
+  filters: AnnotationKind[];
+}
+interface Row {
+  node: TreeNode;
+  depth: number;
+}
+interface EditorHandle {
+  reveal(offset: number, length?: number): Promise<void>;
+  selectedText(): { quote: string; offset: number } | null;
+}
+interface RenderedEditorHandle {
+  revealAnnotation(id: string): Promise<boolean>;
+}
+interface PendingJump {
+  path: string;
+  paneIndex: number;
+  offset: number;
+  length: number;
+  annotationId?: string;
+}
+interface SourceRevealRequest {
+  offset: number;
+  length: number;
+  token: number;
+}
+const kinds: { value: AnnotationKind; label: string; color: string }[] = [
+  { value: 'todo', label: '待办', color: '#d69e16' },
+  { value: 'comment', label: '批注', color: '#2f7bdd' },
+  { value: 'question', label: '疑问', color: '#8856cb' },
+  { value: 'error', label: '错误', color: '#e04c66' },
+];
+const emptyData = (): ProjectData => ({
+  schemaVersion: 1,
+  pinned: [],
+  locked: [],
+  terms: [],
+  termExceptions: [],
+  annotations: [],
+});
+const emptyPane = (): Pane => ({
+  path: null,
+  mode: 'rendered',
+  filters: kinds.map((kind) => kind.value),
+});
+const project = ref<ProjectInfo | null>(null);
+const tree = ref<TreeNode[]>([]);
+const resources = ref<ResourceNode[]>([]);
+const expandedResources = ref(new Set<string>());
+const resourceRootExpanded = ref(true);
+const data = ref<ProjectData>(emptyData());
+const docs = ref<Record<string, DocState>>({});
+const panes = ref<Pane[]>([emptyPane()]);
+const activePane = ref(0);
+const expanded = ref(new Set<string>());
+const sidebar = ref(true);
+const panel = ref<SidePanel>('none');
+const readingPanel = computed(() => panel.value === 'terms' || panel.value === 'history');
+const annotationFilter = ref<AnnotationKind>('todo');
+const query = ref('');
+const hits = ref<SearchHit[]>([]);
+const history = ref<HistoryEntry[]>([]);
+const selectedAnnotation = ref<Annotation | null>(null);
+const annotationPopoverAt = ref({ x: 0, y: 0 });
+const annotationEditing = ref(false);
+const annotationDraft = ref('');
+const annotationSaving = ref(false);
+const hoveredTerm = ref<{
+  term: Term;
+  document: string;
+  offset: number | null;
+  x: number;
+  y: number;
+} | null>(null);
+const focusedTermId = ref<string | null>(null);
+const context = ref<TreeNode | null>(null);
+const contextAt = ref({ x: 0, y: 0 });
+const more = ref(false);
+const projectMenu = ref(false);
+const switcher = ref(false);
+const recentProjects = ref<ProjectInfo[]>(readPreference('vivin.recent-projects', []));
+const locale = ref<'zh' | 'en'>(
+  readPreference<string>('vivin.locale', 'zh') === 'en' ? 'en' : 'zh',
+);
+const theme = ref<'light' | 'dark'>(
+  readPreference<string>('vivin.theme', 'light') === 'dark' ? 'dark' : 'light',
+);
+const split = ref(50);
+const busy = ref(false);
+const refreshing = ref(false);
+const loadingPanes = ref(new Set<number>());
+const paneRequestIds = new Map<number, number>();
+let refreshRequests = 0;
+let refreshGeneration = 0;
+const searching = ref(false);
+const searchRan = ref(false);
+let searchRequest = 0;
+const historyLoading = ref(false);
+let historyRequest = 0;
+const message = ref('');
+function readPreference<T>(key: string, fallback: T): T {
+  try {
+    return JSON.parse(localStorage.getItem(key) ?? 'null') ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+function translate(zh: string, en: string) {
+  return locale.value === 'zh' ? zh : en;
+}
+function kindLabel(kind: AnnotationKind) {
+  const english: Record<AnnotationKind, string> = {
+    todo: 'Todo',
+    comment: 'Comment',
+    question: 'Question',
+    error: 'Error',
+  };
+  return locale.value === 'zh'
+    ? (kinds.find((item) => item.value === kind)?.label ?? kind)
+    : english[kind];
+}
+watch(locale, (value) => localStorage.setItem('vivin.locale', JSON.stringify(value)));
+watch(theme, (value) => localStorage.setItem('vivin.theme', JSON.stringify(value)));
+function rememberProject(next: ProjectInfo) {
+  recentProjects.value = [
+    next,
+    ...recentProjects.value.filter((item) => item.path !== next.path),
+  ].slice(0, 8);
+  localStorage.setItem('vivin.recent-projects', JSON.stringify(recentProjects.value));
+  localStorage.setItem('vivin.last-project', JSON.stringify(next.path));
+}
+const dialog = ref<{
+  kind: 'text' | 'confirm';
+  title: string;
+  value: string;
+} | null>(null);
+let dialogResolve: ((value: string | boolean | null) => void) | null = null;
+function finishDialog(accepted: boolean) {
+  const active = dialog.value;
+  dialog.value = null;
+  const resolve = dialogResolve;
+  dialogResolve = null;
+  if (active?.kind === 'text') resolve?.(accepted ? active.value : null);
+  else resolve?.(accepted);
+}
+function requestText(title: string, value = ''): Promise<string | null> {
+  return new Promise((resolve) => {
+    dialog.value = { kind: 'text', title, value };
+    dialogResolve = resolve as (value: string | boolean | null) => void;
+    void nextTick(() => document.getElementById('vivin-dialog-input')?.focus());
+  });
+}
+function confirmAction(title: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    dialog.value = { kind: 'confirm', title, value: '' };
+    dialogResolve = resolve as (value: string | boolean | null) => void;
+  });
+}
+const sourceEditors: (EditorHandle | null)[] = [];
+const renderedEditors: (RenderedEditorHandle | null)[] = [];
+const sourceRevealRequests = ref<(SourceRevealRequest | null)[]>([]);
+let revealToken = 0;
+let pendingJump: PendingJump | null = null;
+const draftSequences = new Map<string, number>();
+let saveTimer: ReturnType<typeof setTimeout> | undefined;
+let diskTimer: ReturnType<typeof setInterval> | undefined;
+let hideTermTimer: ReturnType<typeof setTimeout> | undefined;
+let hideAnnotationTimer: ReturnType<typeof setTimeout> | undefined;
+let annotationAnchor: Element | null = null;
+const unlisten: UnlistenFn[] = [];
+let closing = false;
+
+const activePath = computed(() => panes.value[activePane.value]?.path ?? null);
+const current = computed(() => (activePath.value ? docs.value[activePath.value] : null));
+const saving = computed(() => Object.values(docs.value).some((doc) => doc.saving));
+const rows = computed<Row[]>(() => {
+  const result: Row[] = [];
+  const visit = (nodes: TreeNode[], depth: number) => {
+    for (const node of nodes) {
+      result.push({ node, depth });
+      if (node.kind === 'directory' && expanded.value.has(node.path))
+        visit(node.children, depth + 1);
+    }
+  };
+  visit(tree.value, 0);
+  return result;
+});
+const resourceRows = computed(() => {
+  const result: { node: ResourceNode; depth: number }[] = [];
+  const visit = (nodes: ResourceNode[], depth: number) => {
+    for (const node of nodes) {
+      result.push({ node, depth });
+      if (node.kind === 'directory' && expandedResources.value.has(node.path))
+        visit(node.children, depth + 1);
+    }
+  };
+  visit(resources.value, 0);
+  return result;
+});
+const resourceCount = computed(() => {
+  const countFiles = (nodes: ResourceNode[]): number =>
+    nodes.reduce(
+      (total, node) => total + (node.kind === 'file' ? 1 : countFiles(node.children)),
+      0,
+    );
+  return countFiles(resources.value);
+});
+const dirty = computed(() =>
+  Object.values(docs.value).some((doc) => doc.content !== doc.savedContent),
+);
+watch(dirty, (value) => {
+  if (nativeAvailable()) void setDirtyDraft(value).catch(report);
+});
+watch(query, () => {
+  hits.value = [];
+  searchRan.value = false;
+});
+
+function lockSource(path: string): string | null {
+  let candidate = path;
+  while (candidate) {
+    if (data.value.locked.includes(candidate)) return candidate;
+    const slash = candidate.lastIndexOf('/');
+    candidate = slash < 0 ? '' : candidate.slice(0, slash);
+  }
+  return null;
+}
+function expandAll(nodes: TreeNode[]) {
+  for (const node of nodes)
+    if (node.kind === 'directory') {
+      expanded.value.add(node.path);
+      expandAll(node.children);
+    }
+}
+async function refresh() {
+  const request = ++refreshGeneration;
+  refreshRequests++;
+  refreshing.value = true;
+  try {
+    const [nextTree, nextResources, nextData] = await Promise.all([
+      listProjectTree(),
+      listResources(),
+      getProjectData(),
+    ]);
+    if (request === refreshGeneration) {
+      tree.value = nextTree;
+      resources.value = nextResources;
+      data.value = nextData;
+      expandAll(nextTree);
+    }
+  } finally {
+    refreshRequests--;
+    refreshing.value = refreshRequests > 0;
+  }
+}
+function report(error: unknown) {
+  message.value = errorMessage(error);
+}
+function remember(doc: Document) {
+  docs.value[doc.path] = {
+    ...doc,
+    savedContent: doc.content,
+    conflict: false,
+    saving: false,
+  };
+}
+
+async function switchProject(create: boolean) {
+  if (busy.value) return;
+  projectMenu.value = false;
+  switcher.value = false;
+  if (!nativeAvailable()) {
+    message.value = translate(
+      '请在桌面窗口中使用项目功能',
+      'Use project features in the desktop app',
+    );
+    return;
+  }
+  if (
+    dirty.value &&
+    !(await confirmAction(
+      translate('有未保存的内容，确定切换项目吗？', 'You have unsaved changes. Switch projects?'),
+    ))
+  )
+    return;
+  const name = create
+    ? (await requestText(translate('项目名称', 'Project name')))?.trim()
+    : undefined;
+  if (create && !name) return;
+  busy.value = true;
+  try {
+    const next = create
+      ? await createProject(name ?? '', locale.value)
+      : await chooseProject(locale.value);
+    if (!next) return;
+    activateProject(next);
+    await refresh();
+    message.value = '';
+  } catch (error) {
+    report(error);
+  } finally {
+    busy.value = false;
+  }
+}
+function activateProject(next: ProjectInfo) {
+  pendingJump = null;
+  selectedAnnotation.value = null;
+  annotationEditing.value = false;
+  sourceRevealRequests.value = [];
+  project.value = next;
+  rememberProject(next);
+  tree.value = [];
+  resources.value = [];
+  data.value = emptyData();
+  docs.value = {};
+  draftSequences.clear();
+  paneRequestIds.clear();
+  loadingPanes.value.clear();
+  panes.value = [emptyPane()];
+  activePane.value = 0;
+  expanded.value.clear();
+  expandedResources.value.clear();
+  resourceRootExpanded.value = true;
+  panel.value = 'none';
+  query.value = '';
+  hits.value = [];
+  searchRan.value = false;
+  searchRequest++;
+  searching.value = false;
+  historyRequest++;
+  historyLoading.value = false;
+  history.value = [];
+}
+async function switchRecent(path: string) {
+  if (busy.value) return;
+  switcher.value = false;
+  if (project.value?.path === path) return;
+  if (
+    dirty.value &&
+    !(await confirmAction(
+      translate('有未保存的内容，确定切换项目吗？', 'You have unsaved changes. Switch projects?'),
+    ))
+  )
+    return;
+  busy.value = true;
+  try {
+    activateProject(await openProject(path));
+    await refresh();
+    message.value = '';
+  } catch (error) {
+    report(error);
+  } finally {
+    busy.value = false;
+  }
+}
+async function restoreLastProject() {
+  const path = readPreference<string>('vivin.last-project', recentProjects.value[0]?.path ?? '');
+  if (!path || project.value) return;
+  busy.value = true;
+  try {
+    const next = await openProject(path);
+    activateProject(next);
+    await refresh();
+    message.value = '';
+  } catch (error) {
+    message.value = translate(
+      `无法恢复上次项目：${path}。请从顶部选择正确的项目文件夹。${errorMessage(error)}`,
+      `Could not reopen the last project: ${path}. Select the correct project folder from the top bar. ${errorMessage(error)}`,
+    );
+  } finally {
+    busy.value = false;
+  }
+}
+async function openDoc(path: string, paneIndex = activePane.value) {
+  const requestId = (paneRequestIds.get(paneIndex) ?? 0) + 1;
+  paneRequestIds.set(paneIndex, requestId);
+  loadingPanes.value.add(paneIndex);
+  try {
+    if (!docs.value[path])
+      remember(path === 'AGENTS.md' ? await readProjectRules() : await readDocument(path));
+    if (paneRequestIds.get(paneIndex) !== requestId) return;
+    const pane = panes.value[paneIndex];
+    if (!pane) return;
+    pane.path = path;
+    if (lockSource(path) || path === 'AGENTS.md') pane.mode = 'source';
+    activePane.value = paneIndex;
+    panel.value = 'none';
+  } catch (error) {
+    report(error);
+  } finally {
+    if (paneRequestIds.get(paneIndex) === requestId) loadingPanes.value.delete(paneIndex);
+  }
+}
+
+async function jumpTo(path: string, offset: number, length = 0, annotationId?: string) {
+  await openDoc(path);
+  const paneIndex = activePane.value;
+  const pane = panes.value[paneIndex];
+  if (!pane) return;
+  if (!annotationId || pane.mode === 'source') {
+    pendingJump = null;
+    sourceRevealRequests.value[paneIndex] = {
+      offset,
+      length,
+      token: ++revealToken,
+    };
+    pane.mode = 'source';
+    return;
+  }
+  pendingJump = { path, paneIndex, offset, length, annotationId };
+  await nextTick();
+  void revealPendingJump(paneIndex);
+}
+
+async function revealPendingJump(index: number) {
+  const jump = pendingJump;
+  if (!jump || jump.paneIndex !== index || panes.value[index]?.path !== jump.path) return;
+  if (jump.annotationId && panes.value[index]?.mode === 'rendered') {
+    const editor = renderedEditors[index];
+    if (!editor) return;
+    const found = await editor.revealAnnotation(jump.annotationId);
+    if (pendingJump !== jump) return;
+    if (found) {
+      pendingJump = null;
+      return;
+    }
+    const pane = panes.value[index];
+    if (pane) pane.mode = 'source';
+    sourceRevealRequests.value[index] = {
+      offset: jump.offset,
+      length: jump.length,
+      token: ++revealToken,
+    };
+    pendingJump = null;
+  }
+}
+
+function setSourceEditor(value: unknown, index: number) {
+  sourceEditors[index] = value as EditorHandle | null;
+}
+function setRenderedEditor(value: unknown, index: number) {
+  renderedEditors[index] = value as RenderedEditorHandle | null;
+  if (value) void revealPendingJump(index);
+}
+function setContent(path: string, content: string) {
+  const doc = docs.value[path];
+  if (!doc || lockSource(path)) return;
+  doc.content = content;
+  if (path !== 'AGENTS.md' && nativeAvailable()) {
+    const sequence = (draftSequences.get(path) ?? 0) + 1;
+    draftSequences.set(path, sequence);
+    void publishDraft(path, content, doc.revision, sequence).catch((error) => {
+      if (draftSequences.get(path) !== sequence) return;
+      doc.conflict = true;
+      report(error);
+    });
+  }
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    void saveAll();
+  }, 1400);
+}
+async function saveOne(path: string) {
+  const doc = docs.value[path];
+  if (!doc || doc.saving || doc.conflict || doc.content === doc.savedContent || lockSource(path))
+    return;
+  doc.saving = true;
+  const submitted = doc.content;
+  try {
+    const saved =
+      path === 'AGENTS.md'
+        ? await saveProjectRules({
+            path,
+            content: submitted,
+            revision: doc.revision,
+          })
+        : await saveDocument({
+            path,
+            content: submitted,
+            revision: doc.revision,
+          });
+    doc.revision = saved.revision;
+    doc.savedContent = submitted;
+    if (doc.content !== submitted && path !== 'AGENTS.md' && nativeAvailable()) {
+      const sequence = (draftSequences.get(path) ?? 0) + 1;
+      draftSequences.set(path, sequence);
+      void publishDraft(path, doc.content, saved.revision, sequence).catch((error) => {
+        if (draftSequences.get(path) === sequence) report(error);
+      });
+    }
+  } catch (error) {
+    if (errorMessage(error).includes('修改')) doc.conflict = true;
+    report(error);
+  } finally {
+    doc.saving = false;
+  }
+}
+async function saveAll() {
+  await Promise.all(Object.keys(docs.value).map(saveOne));
+}
+async function checkDisk() {
+  if (!project.value) return;
+  for (const doc of Object.values(docs.value)) {
+    if (doc.conflict || doc.saving) continue;
+    try {
+      const disk =
+        doc.path === 'AGENTS.md' ? await readProjectRules() : await readDocument(doc.path);
+      if (disk.revision !== doc.revision) doc.conflict = true;
+    } catch {
+      /* A later user action reports an inaccessible file. */
+    }
+  }
+}
+async function reload(path: string) {
+  const doc = docs.value[path];
+  if (
+    doc &&
+    doc.content !== doc.savedContent &&
+    !(await confirmAction(
+      translate(
+        '重新加载会丢弃当前未保存内容，确定继续吗？',
+        'Reloading will discard unsaved changes. Continue?',
+      ),
+    ))
+  )
+    return;
+  try {
+    remember(path === 'AGENTS.md' ? await readProjectRules() : await readDocument(path));
+  } catch (error) {
+    report(error);
+  }
+}
+async function saveCopy(path: string) {
+  const doc = docs.value[path];
+  if (!doc) return;
+  const slash = path.lastIndexOf('/');
+  const directory = slash < 0 ? '' : path.slice(0, slash);
+  const name = await requestText(
+    translate('另存为新文档', 'Save as a new document'),
+    path.slice(slash + 1).replace(/\.md$/i, '-副本.md'),
+  );
+  if (!name) return;
+  try {
+    const created = await createDocument(directory, name.endsWith('.md') ? name : `${name}.md`);
+    const saved = await saveDocument({ ...created, content: doc.content });
+    remember(saved);
+    await refresh();
+    await openDoc(saved.path);
+  } catch (error) {
+    report(error);
+  }
+}
+async function addDoc(directory = '') {
+  const name = await requestText(
+    translate('文档名称', 'Document name'),
+    translate('未命名.md', 'Untitled.md'),
+  );
+  if (!name) return;
+  try {
+    const created = await createDocument(directory, name.endsWith('.md') ? name : `${name}.md`);
+    remember(created);
+    await refresh();
+    await openDoc(created.path);
+  } catch (error) {
+    report(error);
+  }
+}
+async function addDir(directory = '') {
+  const name = await requestText(translate('目录名称', 'Folder name'));
+  if (!name) return;
+  try {
+    await createDirectory(directory, name);
+    await refresh();
+  } catch (error) {
+    report(error);
+  }
+}
+function showContext(event: MouseEvent, node: TreeNode) {
+  context.value = node;
+  contextAt.value = {
+    x: Math.min(event.clientX, window.innerWidth - 180),
+    y: Math.min(event.clientY, window.innerHeight - 250),
+  };
+}
+async function action(kind: 'rename' | 'move' | 'delete' | 'pin' | 'lock') {
+  const node = context.value;
+  context.value = null;
+  if (!node) return;
+  try {
+    if (kind === 'rename' || kind === 'move') {
+      const slash = node.path.lastIndexOf('/');
+      const parent = slash < 0 ? '' : node.path.slice(0, slash);
+      const destination =
+        kind === 'move'
+          ? await requestText(
+              translate('目标目录（根目录留空）', 'Destination folder (blank for root)'),
+              parent,
+            )
+          : parent;
+      const name =
+        kind === 'rename'
+          ? await requestText(translate('新名称', 'New name'), node.name)
+          : node.name;
+      if (destination === null || !name) return;
+      const next = await moveEntry(node.path, destination, name);
+      for (const [path, doc] of Object.entries(docs.value))
+        if (path === node.path || path.startsWith(`${node.path}/`)) {
+          const newPath = next + path.slice(node.path.length);
+          delete docs.value[path];
+          docs.value[newPath] = { ...doc, path: newPath };
+        }
+      for (const pane of panes.value)
+        if (pane.path === node.path || pane.path?.startsWith(`${node.path}/`))
+          pane.path = next + pane.path.slice(node.path.length);
+    } else if (kind === 'delete') {
+      if (
+        !(await confirmAction(
+          translate(
+            `确定删除“${node.name}”及其内容吗？`,
+            `Delete “${node.name}” and its contents?`,
+          ),
+        ))
+      )
+        return;
+      await deleteEntry(node.path);
+      for (const path of Object.keys(docs.value))
+        if (path === node.path || path.startsWith(`${node.path}/`)) delete docs.value[path];
+      for (const pane of panes.value)
+        if (pane.path === node.path || pane.path?.startsWith(`${node.path}/`)) pane.path = null;
+    } else if (kind === 'pin') await setPinned(node.path, !node.pinned);
+    else await setLocked(node.path, node.lockSource !== node.path);
+    await refresh();
+  } catch (error) {
+    report(error);
+  }
+}
+async function runSearch() {
+  if (!query.value.trim()) {
+    hits.value = [];
+    searchRan.value = false;
+    return;
+  }
+  searching.value = true;
+  panel.value = 'search';
+  hits.value = [];
+  const request = ++searchRequest;
+  const term = query.value;
+  try {
+    const found = await searchDocuments(term);
+    if (request === searchRequest && term === query.value) {
+      hits.value = found;
+      searchRan.value = true;
+    }
+  } catch (error) {
+    report(error);
+  } finally {
+    if (request === searchRequest) searching.value = false;
+  }
+}
+
+async function showHistory() {
+  const request = ++historyRequest;
+  historyLoading.value = true;
+  panel.value = 'history';
+  history.value = [];
+  try {
+    const entries = await listHistory();
+    if (request === historyRequest) history.value = entries;
+  } catch (error) {
+    report(error);
+  } finally {
+    if (request === historyRequest) historyLoading.value = false;
+  }
+}
+
+async function undo(id: string) {
+  try {
+    await undoChange(id);
+    history.value = await listHistory();
+    await refresh();
+    await checkDisk();
+  } catch (error) {
+    report(error);
+  }
+}
+
+async function showBridgeInfo() {
+  try {
+    const info = await bridgeInfo();
+    message.value = translate(
+      `Codex 接口：${info.url}；连接令牌见 ${info.configPath}`,
+      `Codex endpoint: ${info.url}; token: ${info.configPath}`,
+    );
+  } catch (error) {
+    report(error);
+  }
+}
+async function termAction(term?: Term) {
+  const name = await requestText(translate('术语名称', 'Term name'), term?.name ?? '');
+  if (!name) return;
+  const definition = await requestText(translate('解释', 'Definition'), term?.definition ?? '');
+  if (definition === null) return;
+  try {
+    await upsertTerm(term?.id ?? null, name, definition);
+    await refresh();
+  } catch (error) {
+    report(error);
+  }
+}
+async function removeTerm(id: string) {
+  if (!(await confirmAction(translate('删除这个术语吗？', 'Delete this term?')))) return;
+  try {
+    await deleteTerm(id);
+    await refresh();
+  } catch (error) {
+    report(error);
+  }
+}
+function count(kind: AnnotationKind) {
+  return data.value.annotations.filter((annotation) => annotation.kind === kind).length;
+}
+function locate(annotation: Annotation, content: string): number | null {
+  return resolveAnnotation(content, annotation);
+}
+function marksFor(path: string) {
+  return annotationMarks(
+    docs.value[path]?.content ?? '',
+    data.value.annotations.filter((item) => item.document === path),
+  );
+}
+function positionAnnotationPopover() {
+  if (!annotationAnchor?.isConnected || !selectedAnnotation.value) return;
+  const rect = annotationAnchor.getBoundingClientRect();
+  const card = document.getElementById('vivin-annotation-popover');
+  const cardWidth = card?.offsetWidth ?? 320;
+  const cardHeight = card?.offsetHeight ?? 160;
+  const below = rect.bottom + 8;
+  annotationPopoverAt.value = {
+    x: Math.max(12, Math.min(rect.left, window.innerWidth - cardWidth - 12)),
+    y:
+      below + cardHeight <= window.innerHeight - 12
+        ? below
+        : Math.max(12, rect.top - cardHeight - 8),
+  };
+}
+function showAnnotationPopover(annotation: Annotation, element: Element) {
+  if (hideAnnotationTimer) clearTimeout(hideAnnotationTimer);
+  if (annotationEditing.value) return;
+  if (selectedAnnotation.value?.id === annotation.id) return;
+  annotationAnchor = element;
+  const rect = element.getBoundingClientRect();
+  annotationPopoverAt.value = {
+    x: Math.max(12, Math.min(rect.left, window.innerWidth - 332)),
+    y: rect.bottom + 8,
+  };
+  selectedAnnotation.value = annotation;
+  annotationDraft.value = annotation.note;
+  hoveredTerm.value = null;
+  void nextTick(positionAnnotationPopover);
+}
+watch(annotationEditing, () => void nextTick(positionAnnotationPopover));
+function keepAnnotationPopover() {
+  if (hideAnnotationTimer) clearTimeout(hideAnnotationTimer);
+  hideAnnotationTimer = undefined;
+}
+function scheduleHideAnnotationPopover() {
+  if (annotationEditing.value) return;
+  if (hideAnnotationTimer) clearTimeout(hideAnnotationTimer);
+  hideAnnotationTimer = setTimeout(() => {
+    selectedAnnotation.value = null;
+    hideAnnotationTimer = undefined;
+  }, 180);
+}
+function handleAnnotationHover(event: MouseEvent) {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const mark = target.closest('[data-annotation-id]');
+  const id = mark?.getAttribute('data-annotation-id');
+  const annotation = data.value.annotations.find((item) => item.id === id);
+  if (annotation && mark) showAnnotationPopover(annotation, mark);
+  else if (selectedAnnotation.value && !hideAnnotationTimer) scheduleHideAnnotationPopover();
+}
+function handleEditorClick(event: MouseEvent) {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const mark = target.closest('[data-annotation-id]');
+  const id = mark?.getAttribute('data-annotation-id');
+  const annotation = data.value.annotations.find((item) => item.id === id);
+  if (annotation && mark) showAnnotationPopover(annotation, mark);
+}
+
+function termOffsets(content: string, term: string): number[] {
+  const offsets: number[] = [];
+  let from = 0;
+  while (from < content.length) {
+    const found = content.indexOf(term, from);
+    if (found < 0) break;
+    offsets.push(found);
+    from = found + Math.max(1, term.length);
+  }
+  return offsets;
+}
+
+function termException(term: Term, document: string, offset: number): TermException | undefined {
+  const content = docs.value[document]?.content ?? '';
+  return data.value.termExceptions.find(
+    (exception) =>
+      exception.document === document &&
+      exception.termId === term.id &&
+      resolveAnnotation(content, {
+        ...exception,
+        kind: 'comment',
+        quote: term.name,
+        note: '',
+      }) === offset,
+  );
+}
+
+function showTermHover(event: MouseEvent, pane: Pane) {
+  if (hideTermTimer) clearTimeout(hideTermTimer);
+  const target = event.target;
+  if (
+    !(target instanceof Element) ||
+    !pane.path ||
+    target.closest('[data-annotation-id]') ||
+    !target.closest('.rendered-editor')
+  ) {
+    hoveredTerm.value = null;
+    return;
+  }
+  const range = document.caretRangeFromPoint?.(event.clientX, event.clientY);
+  const node = range?.startContainer;
+  if (!node || node.nodeType !== Node.TEXT_NODE || !node.textContent) {
+    hoveredTerm.value = null;
+    return;
+  }
+  const text = node.textContent;
+  const terms = [...data.value.terms].sort((a, b) => b.name.length - a.name.length);
+  for (const term of terms) {
+    let start = text.indexOf(term.name);
+    while (start >= 0) {
+      if (range.startOffset >= start && range.startOffset <= start + term.name.length) {
+        const root = target.closest('.rendered-editor');
+        if (!root) break;
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        let seen = 0;
+        let matchCount = 0;
+        while (walker.nextNode()) {
+          const candidate = walker.currentNode;
+          const matches = termOffsets(candidate.textContent ?? '', term.name);
+          if (candidate === node)
+            seen = matchCount + matches.filter((offset) => offset < start).length;
+          matchCount += matches.length;
+        }
+        const raw = termOffsets(docs.value[pane.path]?.content ?? '', term.name);
+        const offset = raw.length === matchCount ? (raw[seen] ?? null) : null;
+        if (offset !== null && termException(term, pane.path, offset)) {
+          hoveredTerm.value = null;
+          return;
+        }
+        hoveredTerm.value = {
+          term,
+          document: pane.path,
+          offset,
+          x: Math.min(event.clientX + 12, window.innerWidth - 280),
+          y: Math.min(event.clientY + 16, window.innerHeight - 160),
+        };
+        return;
+      }
+      start = text.indexOf(term.name, start + 1);
+    }
+  }
+  hoveredTerm.value = null;
+}
+
+function scheduleHideTerm() {
+  hideTermTimer = setTimeout(() => {
+    hoveredTerm.value = null;
+  }, 220);
+}
+function keepTerm() {
+  if (hideTermTimer) clearTimeout(hideTermTimer);
+}
+async function disableTermHere() {
+  const hover = hoveredTerm.value;
+  if (!hover || hover.offset === null) return;
+  try {
+    await setTermException(hover.document, hover.term.id, hover.offset, true);
+    await refresh();
+    hoveredTerm.value = null;
+  } catch (error) {
+    report(error);
+  }
+}
+async function restoreTermException(exception: TermException) {
+  try {
+    await setTermException(
+      exception.document,
+      exception.termId,
+      exception.offset,
+      false,
+      exception.id,
+    );
+    await refresh();
+  } catch (error) {
+    report(error);
+  }
+}
+function viewTerm(term: Term) {
+  focusedTermId.value = term.id;
+  panel.value = 'terms';
+  hoveredTerm.value = null;
+  void nextTick(() =>
+    document.getElementById(`term-${term.id}`)?.scrollIntoView({ block: 'center' }),
+  );
+}
+async function addAnnotation(
+  kind: AnnotationKind,
+  selectedOverride?: { quote: string; offset: number },
+) {
+  const path = activePath.value;
+  const doc = current.value;
+  if (!path || !doc || lockSource(path) || path === 'AGENTS.md') return;
+  const pane = panes.value[activePane.value];
+  let selected =
+    selectedOverride ??
+    (pane?.mode === 'source' ? sourceEditors[activePane.value]?.selectedText() : null);
+  if (!selected && pane?.mode === 'rendered') {
+    const selection = window.getSelection();
+    const range = selection && !selection.isCollapsed ? selection.getRangeAt(0) : null;
+    const rendered = document.querySelector(
+      `[data-pane-index="${activePane.value}"] .rendered-editor`,
+    );
+    if (range && rendered?.contains(range.commonAncestorContainer)) {
+      const quote = selection?.toString() ?? '';
+      const walker = document.createTreeWalker(rendered, NodeFilter.SHOW_TEXT);
+      let allText = '';
+      let startAt = -1;
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        if (node === range.startContainer) startAt = allText.length + range.startOffset;
+        allText += node.textContent ?? '';
+      }
+      const raw = termOffsets(doc.content, quote);
+      const visible = termOffsets(allText, quote);
+      const rank = visible.indexOf(startAt);
+      if (quote && rank >= 0 && raw.length === visible.length && raw[rank] !== undefined)
+        selected = { quote, offset: raw[rank] };
+      else if (quote && raw.length === 1) selected = { quote, offset: raw[0]! };
+    }
+  }
+  if (!selected?.quote) {
+    message.value = translate('请先在文档中选择要标注的文字', 'Select text in the document first');
+    return;
+  }
+  const { quote, offset } = selected;
+  if (doc.content.slice(offset, offset + quote.length) !== quote) {
+    message.value = translate(
+      '无法准确定位选中文字，请切换原文模式重试',
+      'Cannot locate the selection. Try source mode.',
+    );
+    return;
+  }
+  const note = await requestText(translate('标注说明（可留空）', 'Annotation note (optional)'), '');
+  if (note === null) return;
+  try {
+    await upsertAnnotation({
+      id: '',
+      document: path,
+      kind,
+      quote,
+      offset,
+      note,
+      contextBefore: doc.content.slice(Math.max(0, offset - 32), offset),
+      contextAfter: doc.content.slice(offset + quote.length, offset + quote.length + 32),
+    });
+    await refresh();
+  } catch (error) {
+    report(error);
+  }
+}
+function startAnnotationEdit() {
+  const annotation = selectedAnnotation.value;
+  if (!annotation) return;
+  keepAnnotationPopover();
+  annotationDraft.value = annotation.note;
+  annotationEditing.value = true;
+  void nextTick(() => document.getElementById('vivin-annotation-note')?.focus());
+}
+async function updateAnnotation(annotation: Annotation) {
+  if (annotationSaving.value) return;
+  annotationSaving.value = true;
+  try {
+    const updated = await upsertAnnotation({
+      ...annotation,
+      note: annotationDraft.value,
+    });
+    if (selectedAnnotation.value?.id === annotation.id) selectedAnnotation.value = updated;
+    annotationEditing.value = false;
+    await refresh();
+  } catch (error) {
+    report(error);
+  } finally {
+    annotationSaving.value = false;
+  }
+}
+async function removeAnnotation(annotation: Annotation) {
+  if (!(await confirmAction(translate('删除这个标注吗？', 'Delete this annotation?')))) return;
+  try {
+    await deleteAnnotation(annotation.id);
+    selectedAnnotation.value = null;
+    annotationEditing.value = false;
+    await refresh();
+  } catch (error) {
+    report(error);
+  }
+}
+function toggleSplit() {
+  if (panes.value.length === 2) {
+    panes.value.splice(1);
+    activePane.value = 0;
+  } else
+    panes.value.push({
+      path: activePath.value,
+      mode: 'source',
+      filters: kinds.map((kind) => kind.value),
+    });
+}
+function resize(event: PointerEvent) {
+  const host = (event.currentTarget as HTMLElement).parentElement;
+  if (!host) return;
+  const move = (next: PointerEvent) => {
+    const rect = host.getBoundingClientRect();
+    split.value = Math.max(25, Math.min(75, (100 * (next.clientX - rect.left)) / rect.width));
+  };
+  const stop = () => {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', stop);
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', stop, { once: true });
+}
+function shortcut(event: KeyboardEvent) {
+  if (event.key === 'Escape' && dialog.value) {
+    finishDialog(false);
+    return;
+  }
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+    event.preventDefault();
+    void saveAll();
+  }
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
+    event.preventDefault();
+    panel.value = 'search';
+    void nextTick(() => document.getElementById('vivin-search')?.focus());
+  }
+  if (event.key === 'Escape') {
+    context.value = null;
+    more.value = false;
+    projectMenu.value = false;
+    switcher.value = false;
+  }
+}
+onMounted(() => {
+  window.addEventListener('keydown', shortcut);
+  if (nativeAvailable()) {
+    void restoreLastProject();
+    void getCurrentWindow()
+      .onCloseRequested(async (event) => {
+        if (closing || !dirty.value) return;
+        event.preventDefault();
+        if (
+          !(await confirmAction(
+            translate(
+              '有未保存的内容，保存后关闭窗口吗？',
+              'You have unsaved changes. Save and close?',
+            ),
+          ))
+        )
+          return;
+        await saveAll();
+        if (
+          dirty.value &&
+          !(await confirmAction(
+            translate(
+              '部分内容仍未保存，确定丢弃并关闭吗？',
+              'Some changes are still unsaved. Discard and close?',
+            ),
+          ))
+        )
+          return;
+        closing = true;
+        await getCurrentWindow().close();
+      })
+      .then((stop) => unlisten.push(stop));
+    void listen<ProjectInfo>('vivin://project-opened', (event) => {
+      activateProject(event.payload);
+      void refresh();
+    }).then((stop) => unlisten.push(stop));
+    void listen('vivin://project-closed', () => {
+      localStorage.setItem('vivin.last-project', JSON.stringify(''));
+      project.value = null;
+      tree.value = [];
+      resources.value = [];
+      expandedResources.value.clear();
+      resourceRootExpanded.value = true;
+      data.value = emptyData();
+      docs.value = {};
+      draftSequences.clear();
+      paneRequestIds.clear();
+      loadingPanes.value.clear();
+      panes.value = [emptyPane()];
+      activePane.value = 0;
+      panel.value = 'none';
+      hits.value = [];
+      searchRan.value = false;
+      searchRequest++;
+      searching.value = false;
+      historyRequest++;
+      historyLoading.value = false;
+      history.value = [];
+    }).then((stop) => unlisten.push(stop));
+    void listen<{ document: Document; beforeContent: string }>(
+      'vivin://document-written',
+      (event) => {
+        const local = docs.value[event.payload.document.path];
+        if (!local) return;
+        if (local.content !== event.payload.beforeContent) {
+          local.conflict = true;
+          return;
+        }
+        remember(event.payload.document);
+      },
+    ).then((stop) => unlisten.push(stop));
+    void listen<string>('vivin://document-changed', (event) => {
+      const doc = docs.value[event.payload];
+      if (!doc) return;
+      if (doc.content !== doc.savedContent) {
+        doc.conflict = true;
+        return;
+      }
+      void readDocument(event.payload).then(remember).catch(report);
+    }).then((stop) => unlisten.push(stop));
+    void listen('vivin://project-changed', () => {
+      if (project.value) void refresh();
+    }).then((stop) => unlisten.push(stop));
+    void listen<{ from: string; to: string }>('vivin://entry-moved', (event) => {
+      const { from, to } = event.payload;
+      for (const [path, doc] of Object.entries(docs.value))
+        if (path === from || path.startsWith(`${from}/`)) {
+          const next = to + path.slice(from.length);
+          delete docs.value[path];
+          docs.value[next] = { ...doc, path: next };
+        }
+      for (const pane of panes.value)
+        if (pane.path === from || pane.path?.startsWith(`${from}/`))
+          pane.path = to + pane.path.slice(from.length);
+    }).then((stop) => unlisten.push(stop));
+    void listen<{ path: string }>('vivin://entry-deleted', (event) => {
+      const path = event.payload.path;
+      for (const key of Object.keys(docs.value))
+        if (key === path || key.startsWith(`${path}/`)) delete docs.value[key];
+      for (const pane of panes.value)
+        if (pane.path === path || pane.path?.startsWith(`${path}/`)) pane.path = null;
+    }).then((stop) => unlisten.push(stop));
+  }
+  diskTimer = setInterval(() => {
+    void checkDisk();
+  }, 2500);
+});
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', shortcut);
+  if (saveTimer) clearTimeout(saveTimer);
+  if (diskTimer) clearInterval(diskTimer);
+  if (hideAnnotationTimer) clearTimeout(hideAnnotationTimer);
+  for (const stop of unlisten) stop();
+});
+</script>
+
 <template>
-  <main class="flex min-h-screen items-center justify-center bg-slate-100 text-slate-900">
-    <div class="text-center">
-      <h1 class="text-3xl font-semibold tracking-tight">vivin</h1>
-      <p class="mt-3 text-sm text-slate-500">尚未打开项目</p>
+  <div
+    :class="[
+      'app-shell flex h-screen flex-col overflow-hidden bg-[#f3f6fa] text-slate-900',
+      theme === 'dark' ? 'theme-dark' : '',
+    ]"
+    @click="
+      context = null;
+      projectMenu = false;
+      switcher = false;
+      more = false;
+    "
+  >
+    <AppTitlebar :sidebar-open="sidebar" :locale="locale">
+      <template #sidebar-control>
+        <button
+          class="rounded-md p-1.5 text-slate-600 hover:bg-slate-200/70"
+          :title="translate('切换侧栏', 'Toggle sidebar')"
+          @click.stop="sidebar = !sidebar"
+        >
+          <PanelLeft :size="18" />
+        </button>
+      </template>
+      <div class="relative flex min-w-0 items-center gap-2">
+        <button
+          class="flex min-w-0 items-center gap-1 rounded-md px-1.5 py-1 text-sm font-semibold hover:bg-slate-200/70"
+          :title="project?.path || translate('切换项目', 'Switch project')"
+          :aria-label="translate('切换项目', 'Switch project')"
+          @click.stop="
+            switcher = !switcher;
+            projectMenu = false;
+            more = false;
+          "
+        >
+          <span class="truncate">{{ project?.name || 'vivin' }}</span>
+          <ChevronDown :size="14" class="shrink-0 text-slate-500" />
+        </button>
+        <div
+          v-if="switcher"
+          class="absolute left-0 top-9 z-40 w-72 rounded-xl bg-white p-1.5 text-sm shadow-xl"
+          role="menu"
+        >
+          <p class="px-2 py-1 text-xs text-slate-400">
+            {{ translate('最近项目', 'Recent projects') }}
+          </p>
+          <p v-if="project" class="mb-1 break-all px-2 text-[11px] text-slate-500">
+            {{ translate('当前项目：', 'Current project: ') }}{{ project.path }}
+          </p>
+          <div v-if="recentProjects.length === 0" class="px-2 py-3 text-center">
+            <img src="/empty-project-files.svg" alt="" class="mx-auto mb-1 h-16 w-24" />
+            <p class="text-xs text-slate-400">
+              {{ translate('还没有最近项目', 'No recent projects') }}
+            </p>
+          </div>
+          <button
+            v-for="item in recentProjects"
+            :key="item.path"
+            class="block w-full truncate rounded-lg px-2 py-2 text-left hover:bg-slate-100"
+            :title="item.path"
+            role="menuitem"
+            @click.stop="switchRecent(item.path)"
+          >
+            {{ item.name
+            }}<span v-if="project?.path === item.path" class="ml-2 text-blue-600">✓</span
+            ><span class="block truncate text-[11px] font-normal text-slate-400">{{
+              item.path
+            }}</span>
+          </button>
+          <button
+            class="mt-1 block w-full rounded-lg px-2 py-2 text-left text-blue-600 hover:bg-slate-100"
+            role="menuitem"
+            @click.stop="switchProject(false)"
+          >
+            {{ translate('打开其他项目…', 'Open another project…') }}
+          </button>
+        </div>
+        <LoaderCircle
+          v-if="busy || refreshing"
+          :size="15"
+          class="animate-spin text-blue-600"
+          :title="translate('正在加载项目', 'Loading project')"
+        />
+      </div>
+      <div class="flex shrink-0 items-center gap-1 text-slate-600">
+        <div class="relative shrink-0">
+          <button
+            :title="translate('新建或打开项目', 'Create or open project')"
+            :aria-label="translate('新建或打开项目', 'Create or open project')"
+            class="rounded-md p-1 text-slate-600 hover:bg-slate-200/70"
+            @click.stop="
+              projectMenu = !projectMenu;
+              more = false;
+            "
+          >
+            <Plus :size="17" />
+          </button>
+          <div
+            v-if="projectMenu"
+            class="absolute right-0 top-8 z-40 w-44 rounded-xl bg-white p-1 text-sm shadow-lg"
+            role="menu"
+          >
+            <button
+              class="block w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
+              role="menuitem"
+              @click.stop="switchProject(true)"
+            >
+              {{ translate('新建项目', 'New project') }}
+            </button>
+            <button
+              class="block w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
+              role="menuitem"
+              @click.stop="switchProject(false)"
+            >
+              {{ translate('打开项目文件夹', 'Open project folder') }}
+            </button>
+          </div>
+        </div>
+        <template v-if="project">
+          <label
+            class="mr-2 flex w-44 items-center gap-2 rounded-lg bg-white/80 px-2.5 py-1.5 lg:w-60"
+          >
+            <Search
+              :size="16"
+              class="shrink-0 text-slate-400"
+              :title="translate('搜索文档', 'Search documents')"
+            />
+            <input
+              id="vivin-search"
+              v-model="query"
+              class="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-slate-400"
+              :placeholder="
+                translate('搜索文档、标题或内容…', 'Search documents, titles, or content…')
+              "
+              :aria-label="translate('搜索文档', 'Search documents')"
+              @focus="panel = 'search'"
+              @keydown.enter.prevent="runSearch"
+            />
+          </label>
+          <div class="mx-1 flex rounded-md bg-slate-200/70 p-0.5 text-xs">
+            <button
+              v-for="mode in ['source', 'rendered'] as const"
+              :key="mode"
+              :disabled="!!(activePath && lockSource(activePath)) || activePath === 'AGENTS.md'"
+              :class="[
+                panes[activePane]?.mode === mode
+                  ? 'bg-white text-slate-900 shadow-sm'
+                  : 'text-slate-500',
+                'rounded px-2 py-1 disabled:opacity-40',
+              ]"
+              @click.stop="panes[activePane]!.mode = mode"
+            >
+              {{ mode === 'source' ? translate('原文', 'Source') : translate('排版', 'Rendered') }}
+            </button>
+          </div>
+          <button
+            :title="translate('分栏', 'Split view')"
+            class="rounded-md p-1.5 hover:bg-slate-200/70"
+            @click.stop="toggleSplit"
+          >
+            <PanelsTopLeft :size="17" />
+          </button>
+          <button
+            :title="translate('保存', 'Save')"
+            class="rounded-md p-1.5 hover:bg-slate-200/70"
+            @click.stop="saveAll"
+          >
+            <LoaderCircle v-if="saving" :size="17" class="animate-spin" />
+            <Save v-else :size="17" />
+          </button>
+          <div class="relative">
+            <button
+              :title="translate('更多', 'More')"
+              class="rounded-md p-1.5 hover:bg-slate-200/70"
+              @click.stop="
+                more = !more;
+                projectMenu = false;
+              "
+            >
+              <MoreHorizontal :size="18" />
+            </button>
+            <div
+              v-if="more"
+              class="absolute right-0 top-9 z-30 w-40 rounded-xl bg-white p-1 text-sm shadow-lg"
+            >
+              <button
+                class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
+                @click.stop="
+                  more = false;
+                  openDoc('AGENTS.md');
+                "
+              >
+                {{ translate('编辑项目规则', 'Edit project rules') }}</button
+              ><button
+                class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
+                @click.stop="
+                  more = false;
+                  panel = 'terms';
+                "
+              >
+                {{ translate('项目术语', 'Project terms') }}</button
+              ><button
+                class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
+                @click.stop="
+                  more = false;
+                  showHistory();
+                "
+              >
+                {{ translate('AI 修改记录', 'AI edit history') }}</button
+              ><button
+                class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
+                @click.stop="
+                  more = false;
+                  showBridgeInfo();
+                "
+              >
+                {{ translate('Codex 连接信息', 'Codex connection') }}
+              </button>
+            </div>
+          </div>
+        </template>
+        <button
+          class="rounded-md p-1.5 hover:bg-slate-200/70"
+          :title="translate('切换语言', 'Switch language')"
+          :aria-label="translate('切换语言', 'Switch language')"
+          @click.stop="locale = locale === 'zh' ? 'en' : 'zh'"
+        >
+          <Languages :size="17" />
+        </button>
+        <button
+          class="rounded-md p-1.5 hover:bg-slate-200/70"
+          :title="
+            theme === 'dark'
+              ? translate('切换到浅色模式', 'Switch to light mode')
+              : translate('切换到深色模式', 'Switch to dark mode')
+          "
+          :aria-label="translate('切换明暗模式', 'Toggle appearance')"
+          @click.stop="theme = theme === 'dark' ? 'light' : 'dark'"
+        >
+          <Sun v-if="theme === 'dark'" :size="17" /><Moon v-else :size="17" />
+        </button>
+      </div>
+    </AppTitlebar>
+    <div class="flex min-h-0 flex-1">
+      <aside v-if="sidebar" class="flex w-64 shrink-0 flex-col bg-[#f3f6fa]">
+        <div
+          class="flex items-center justify-between px-4 pb-2 pt-4 text-xs font-semibold text-slate-500"
+        >
+          <span>{{ translate('项目文件', 'Project files') }}</span>
+          <div class="flex gap-1">
+            <button
+              v-if="project"
+              :title="translate('新建目录', 'New folder')"
+              class="rounded p-1 hover:bg-slate-200"
+              @click.stop="addDir()"
+            >
+              <Folder :size="15" /></button
+            ><button
+              v-if="project"
+              :title="translate('新建文档', 'New document')"
+              class="rounded p-1 hover:bg-slate-200"
+              @click.stop="addDoc()"
+            >
+              <FilePlus2 :size="15" />
+            </button>
+          </div>
+        </div>
+        <p v-if="!project" class="mx-5 mt-1 text-xs leading-5 text-slate-400">
+          {{
+            translate(
+              '点击右上角 + 新建或打开项目',
+              'Use + at the top right to create or open a project',
+            )
+          }}
+        </p>
+        <div v-if="project" class="min-h-0 flex-1 overflow-y-auto">
+          <div class="px-3 py-2">
+            <div v-if="refreshing && rows.length === 0" class="space-y-3 px-3 py-2" role="status">
+              <div
+                v-for="line in 3"
+                :key="line"
+                class="h-3 animate-pulse rounded bg-slate-200/70"
+              />
+              <span class="sr-only">{{
+                translate('正在加载项目文件', 'Loading project files')
+              }}</span>
+            </div>
+            <div v-else-if="!refreshing && rows.length === 0" class="px-2 pb-5 pt-4 text-center">
+              <img
+                src="/empty-project-files.svg"
+                alt=""
+                class="mx-auto mb-2 h-28 w-40 object-contain"
+              />
+              <p class="text-xs font-medium text-slate-600">
+                {{ translate('这里还没有文档', 'No documents yet') }}
+              </p>
+              <p class="mt-1 text-[11px] leading-5 text-slate-400">
+                {{ translate('新建一篇，开始写作', 'Create one to start writing') }}
+              </p>
+            </div>
+            <button
+              v-for="row in rows"
+              :key="row.node.path"
+              :title="row.node.name"
+              :class="[
+                'flex w-full items-center gap-1 rounded-md py-1.5 pr-2 text-left text-sm',
+                activePath === row.node.path
+                  ? 'bg-blue-600 text-white hover:bg-blue-700'
+                  : 'hover:bg-slate-200/70',
+              ]"
+              :style="{ paddingLeft: `${row.depth * 16 + 8}px` }"
+              @click.stop="
+                row.node.kind === 'directory'
+                  ? expanded.has(row.node.path)
+                    ? expanded.delete(row.node.path)
+                    : expanded.add(row.node.path)
+                  : openDoc(row.node.path)
+              "
+              @contextmenu.prevent.stop="showContext($event, row.node)"
+            >
+              <component
+                :is="expanded.has(row.node.path) ? ChevronDown : ChevronRight"
+                v-if="row.node.kind === 'directory'"
+                :size="14"
+              /><span v-else class="w-3.5" /><Folder
+                v-if="row.node.kind === 'directory'"
+                :size="16"
+                class="shrink-0"
+              /><FileText v-else :size="16" class="shrink-0" /><span
+                class="min-w-0 flex-1 truncate"
+                >{{ row.node.name }}</span
+              ><Bookmark
+                v-if="row.node.pinned"
+                :size="12"
+                fill="currentColor"
+                :title="translate('已固定', 'Pinned')"
+              /><LockKeyhole
+                v-if="row.node.lockSource"
+                :size="12"
+                :class="row.node.lockSource === row.node.path ? '' : 'opacity-45'"
+                :title="
+                  row.node.lockSource === row.node.path
+                    ? translate('直接锁定', 'Locked directly')
+                    : translate(
+                        `由 ${row.node.lockSource} 锁定`,
+                        `Locked by ${row.node.lockSource}`,
+                      )
+                "
+              />
+            </button>
+          </div>
+          <div class="px-3 py-3">
+            <div
+              class="flex items-center justify-between px-2 text-xs font-semibold text-slate-500"
+            >
+              <span>{{ translate('资源库', 'Resources') }}</span>
+            </div>
+            <button
+              class="mt-1 flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm hover:bg-slate-200/70"
+              :title="translate('展开或收起资源库', 'Expand or collapse resources')"
+              :aria-expanded="resourceRootExpanded"
+              @click.stop="resourceRootExpanded = !resourceRootExpanded"
+            >
+              <component :is="resourceRootExpanded ? ChevronDown : ChevronRight" :size="14" />
+              <Folder :size="16" class="fill-blue-600 text-blue-600" />
+              <span class="min-w-0 flex-1 truncate">resources</span>
+              <span class="text-xs text-slate-400">{{ resourceCount }}</span>
+            </button>
+            <div v-if="resourceRootExpanded" class="max-h-36 overflow-y-auto">
+              <div v-if="resourceRows.length === 0" class="px-4 py-2 text-center">
+                <img src="/empty-list.svg" alt="" class="mx-auto mb-1 h-16 w-24" />
+                <p class="text-[11px] text-slate-400">
+                  {{ translate('还没有资源文件', 'No resource files') }}
+                </p>
+              </div>
+              <div
+                v-for="row in resourceRows"
+                :key="row.node.path"
+                :title="row.node.name"
+                class="group flex items-center gap-1 rounded-md py-1 text-sm hover:bg-slate-200/70"
+                :style="{ paddingLeft: `${24 + row.depth * 14}px` }"
+              >
+                <button
+                  v-if="row.node.kind === 'directory'"
+                  class="flex min-w-0 flex-1 items-center gap-1 text-left"
+                  @click.stop="
+                    expandedResources.has(row.node.path)
+                      ? expandedResources.delete(row.node.path)
+                      : expandedResources.add(row.node.path)
+                  "
+                >
+                  <component
+                    :is="expandedResources.has(row.node.path) ? ChevronDown : ChevronRight"
+                    :size="13"
+                  />
+                  <Folder :size="15" class="shrink-0 text-blue-600" />
+                  <span class="truncate">{{ row.node.name }}</span>
+                </button>
+                <template v-else>
+                  <span class="w-3" />
+                  <FileText :size="15" class="shrink-0" />
+                  <span class="min-w-0 flex-1 truncate" :title="row.node.localPath">
+                    {{ row.node.name }}
+                  </span>
+                  <span class="pr-2 text-[10px] text-slate-400">{{ row.node.fileType }}</span>
+                </template>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div v-if="project" class="mt-auto space-y-0.5 px-3 pb-4 pt-3">
+          <button
+            v-for="kind in kinds"
+            :key="kind.value"
+            class="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-sm hover:bg-slate-200/70"
+            @click.stop="
+              annotationFilter = kind.value;
+              panel = 'annotations';
+            "
+          >
+            <span class="flex items-center gap-1.5"
+              ><i class="h-2 w-2 rounded-full" :style="{ background: kind.color }" />{{
+                kindLabel(kind.value)
+              }}</span
+            ><span>{{ count(kind.value) }}</span>
+          </button>
+        </div>
+      </aside>
+      <div class="flex min-w-0 flex-1 flex-col">
+        <div class="relative flex min-h-0 flex-1 gap-3 px-4 pb-4">
+          <div class="flex min-w-0 flex-1">
+            <template v-for="(pane, index) in panes" :key="index"
+              ><div
+                v-if="index === 1"
+                v-show="!readingPanel"
+                class="group flex w-2 shrink-0 cursor-col-resize items-center justify-center"
+                @pointerdown.prevent="resize"
+              >
+                <div class="h-10 w-1 rounded bg-slate-300 group-hover:bg-blue-400" />
+              </div>
+              <section
+                v-show="!readingPanel || index === activePane"
+                :data-pane-index="index"
+                :style="
+                  panes.length === 2 && !readingPanel
+                    ? { width: index === 0 ? `${split}%` : `${100 - split}%` }
+                    : {}
+                "
+                class="flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl bg-white"
+                @pointerdown="activePane = index"
+                @click.capture="handleEditorClick"
+                @mousemove="
+                  handleAnnotationHover($event);
+                  showTermHover($event, pane);
+                "
+                @mouseleave="
+                  scheduleHideTerm();
+                  scheduleHideAnnotationPopover();
+                "
+              >
+                <LoadingState
+                  v-if="loadingPanes.has(index)"
+                  :label="translate('正在打开文档…', 'Opening document…')"
+                />
+                <template v-else-if="pane.path && docs[pane.path]"
+                  ><div class="flex h-11 shrink-0 items-center justify-between px-6 text-sm">
+                    <span
+                      :class="[
+                        'truncate font-medium',
+                        index === activePane && panes.length === 2 ? 'text-blue-700' : '',
+                      ]"
+                      >{{ pane.path
+                      }}<span
+                        v-if="docs[pane.path]?.content !== docs[pane.path]?.savedContent"
+                        class="ml-1 text-blue-500"
+                        >•</span
+                      ></span
+                    ><span
+                      v-if="lockSource(pane.path)"
+                      class="ml-2 flex shrink-0 items-center gap-1 text-xs text-amber-700"
+                      ><LockKeyhole :size="13" />{{
+                        lockSource(pane.path) === pane.path
+                          ? translate('已锁定', 'Locked')
+                          : translate(
+                              `由 ${lockSource(pane.path)} 锁定`,
+                              `Locked by ${lockSource(pane.path)}`,
+                            )
+                      }}</span
+                    >
+                  </div>
+                  <div
+                    v-if="docs[pane.path]?.conflict"
+                    class="flex flex-wrap items-center gap-2 bg-amber-50 px-4 py-2 text-xs text-amber-900"
+                  >
+                    <span>{{
+                      translate(
+                        '磁盘上的文档已改变，自动保存已暂停。',
+                        'The document changed on disk. Autosave is paused.',
+                      )
+                    }}</span
+                    ><button class="underline" @click.stop="reload(pane.path!)">
+                      {{ translate('重新加载磁盘版本', 'Reload disk version') }}</button
+                    ><button
+                      v-if="pane.path !== 'AGENTS.md'"
+                      class="underline"
+                      @click.stop="saveCopy(pane.path!)"
+                    >
+                      {{
+                        translate(
+                          '将当前内容另存为新文档',
+                          'Save current content as a new document',
+                        )
+                      }}
+                    </button>
+                  </div>
+                  <div class="flex min-h-0 flex-1">
+                    <MarkdownSourceEditor
+                      v-if="
+                        pane.mode === 'source' ||
+                        !!lockSource(pane.path) ||
+                        pane.path === 'AGENTS.md'
+                      "
+                      :key="`${index}:${pane.path}:source`"
+                      :ref="(value) => setSourceEditor(value, index)"
+                      :model-value="docs[pane.path]?.content ?? ''"
+                      :document-path="pane.path"
+                      :reveal-request="sourceRevealRequests[index] ?? undefined"
+                      :annotations="marksFor(pane.path)"
+                      :readonly="!!lockSource(pane.path)"
+                      :locale="locale"
+                      class="min-w-0 flex-1"
+                      @update:model-value="setContent(pane.path!, $event)"
+                      @error="message = $event"
+                      @annotation-request="
+                        (kind, selected) => {
+                          activePane = index;
+                          addAnnotation(kind, selected);
+                        }
+                      "
+                    /><MarkdownRenderedEditor
+                      v-else
+                      :key="`${index}:${pane.path}:rendered:${locale}`"
+                      :ref="(value) => setRenderedEditor(value, index)"
+                      :model-value="docs[pane.path]?.content ?? ''"
+                      :document-path="pane.path"
+                      :annotations="marksFor(pane.path)"
+                      :locale="locale"
+                      class="min-w-0 flex-1"
+                      @update:model-value="setContent(pane.path!, $event)"
+                      @error="message = $event"
+                      @annotation-request="
+                        (kind, selected) => {
+                          activePane = index;
+                          addAnnotation(kind, selected);
+                        }
+                      "
+                      @incompatible="
+                        pane.mode = 'source';
+                        message = translate(
+                          '排版模式无法完整保留此 Markdown，已切回原文模式',
+                          'Rendered mode cannot preserve this Markdown; switched to source mode',
+                        );
+                      "
+                    />
+                    <div
+                      v-if="pane.path !== 'AGENTS.md'"
+                      class="relative flex w-8 shrink-0 flex-col items-center py-2"
+                    >
+                      <div class="group relative mb-2">
+                        <button
+                          :title="translate('筛选缩略图标注', 'Filter annotation minimap')"
+                          class="rounded p-1 hover:bg-slate-100"
+                        >
+                          <ChevronDown :size="13" />
+                        </button>
+                        <div
+                          class="absolute right-6 top-0 z-20 hidden w-24 rounded-lg bg-white p-1 text-xs shadow-lg group-hover:block"
+                        >
+                          <button
+                            v-for="kind in kinds"
+                            :key="kind.value"
+                            class="block w-full rounded px-2 py-1 text-left hover:bg-slate-100"
+                            @click.stop="
+                              pane.filters = pane.filters.includes(kind.value)
+                                ? pane.filters.filter((value) => value !== kind.value)
+                                : [...pane.filters, kind.value]
+                            "
+                          >
+                            {{ pane.filters.includes(kind.value) ? '✓' : '　' }}
+                            {{ kindLabel(kind.value) }}
+                          </button>
+                        </div>
+                      </div>
+                      <button
+                        v-for="annotation in data.annotations.filter(
+                          (item) =>
+                            item.document === pane.path &&
+                            pane.filters.includes(item.kind) &&
+                            locate(item, docs[pane.path]?.content ?? '') !== null,
+                        )"
+                        :key="annotation.id"
+                        :aria-label="`${kindLabel(annotation.kind)}: ${annotation.quote}`"
+                        class="group absolute left-1 flex h-5 w-6 -translate-y-1/2 items-center justify-center rounded hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
+                        :style="{
+                          top: `${Math.max(12, Math.min(95, (100 * (locate(annotation, docs[pane.path]?.content ?? '') ?? 0)) / Math.max(1, docs[pane.path]?.content.length ?? 1)))}%`,
+                        }"
+                        @click.stop="
+                          jumpTo(
+                            annotation.document,
+                            locate(annotation, docs[annotation.document]?.content ?? '') ??
+                              annotation.offset,
+                            annotation.quote.length,
+                            annotation.id,
+                          )
+                        "
+                      >
+                        <span
+                          class="h-[3px] w-3.5 rounded-full transition-all group-hover:w-5"
+                          :style="{
+                            background: kinds.find((kind) => kind.value === annotation.kind)?.color,
+                          }"
+                        />
+                        <span
+                          class="pointer-events-none absolute right-7 top-1/2 z-30 w-max max-w-56 -translate-y-1/2 break-words whitespace-normal rounded-lg bg-slate-900 px-2.5 py-1.5 text-left text-xs leading-5 text-white opacity-0 shadow-lg group-hover:opacity-100 group-focus-visible:opacity-100"
+                          >{{ annotation.quote }}</span
+                        >
+                      </button>
+                    </div>
+                  </div>
+                </template>
+                <div v-else class="flex flex-1 items-center justify-center px-8 text-center">
+                  <div class="max-w-xs">
+                    <img
+                      src="/empty-writing.svg"
+                      alt=""
+                      class="mx-auto mb-5 h-44 w-60 object-contain"
+                    />
+                    <h1 class="text-lg font-semibold tracking-tight">
+                      {{
+                        !project
+                          ? translate('开始写作', 'Start writing')
+                          : rows.length === 0
+                            ? translate('项目里还没有文档', 'No documents in this project')
+                            : translate('选择一篇文档', 'Choose a document')
+                      }}
+                    </h1>
+                    <p class="mt-2 text-sm leading-6 text-slate-400">
+                      {{
+                        !project
+                          ? translate(
+                              '点击右上角的 +，新建项目或打开已有文件夹。',
+                              'Use + at the top right to create a project or open an existing folder.',
+                            )
+                          : rows.length === 0
+                            ? translate(
+                                '新建一篇 Markdown 文档，内容会保存在项目文件夹中。',
+                                'Create a Markdown document. It will be saved in the project folder.',
+                              )
+                            : translate(
+                                '从左侧项目文件中选择文档，或新建一篇。',
+                                'Choose a document on the left, or create one.',
+                              )
+                      }}
+                    </p>
+                    <button
+                      v-if="project && rows.length === 0"
+                      class="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700"
+                      @click.stop="addDoc()"
+                    >
+                      {{ translate('新建文档', 'New document') }}
+                    </button>
+                  </div>
+                </div>
+              </section></template
+            >
+          </div>
+          <div v-if="busy" class="absolute inset-0 z-20 flex bg-[#f3f6fa]/85" aria-busy="true">
+            <LoadingState :label="translate('正在打开项目…', 'Opening project…')" />
+          </div>
+          <aside
+            v-if="panel !== 'none' && project"
+            :class="readingPanel ? 'min-w-0 flex-1' : 'w-80 shrink-0'"
+            class="flex flex-col overflow-hidden rounded-2xl bg-white"
+          >
+            <div
+              :class="readingPanel ? 'h-11 px-6 font-medium' : 'h-12 px-4 font-semibold'"
+              class="flex shrink-0 items-center justify-between text-sm"
+            >
+              <span>{{
+                panel === 'search'
+                  ? translate('项目搜索', 'Project search')
+                  : panel === 'terms'
+                    ? translate('项目术语', 'Project terms')
+                    : panel === 'history'
+                      ? translate('AI 修改记录', 'AI edit history')
+                      : translate('项目标注', 'Project annotations')
+              }}</span
+              ><button
+                class="rounded p-1 hover:bg-slate-100"
+                :title="translate('关闭面板', 'Close panel')"
+                @click.stop="panel = 'none'"
+              >
+                <X :size="16" />
+              </button>
+            </div>
+            <div v-if="panel === 'search'" class="min-h-0 overflow-y-auto p-3">
+              <form class="flex gap-2" @submit.prevent="runSearch">
+                <input
+                  v-model="query"
+                  autofocus
+                  :placeholder="translate('搜索 Markdown 正文', 'Search Markdown content')"
+                  class="min-w-0 flex-1 rounded-lg bg-slate-100 px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-200"
+                /><button class="rounded bg-blue-600 px-3 text-xs text-white">
+                  {{ translate('搜索', 'Search') }}
+                </button>
+              </form>
+              <LoadingState v-if="searching" :label="translate('正在搜索…', 'Searching…')" />
+              <EmptyPanel
+                v-else-if="!query.trim()"
+                :label="
+                  translate(
+                    '输入关键词，搜索当前项目的 Markdown 文档。',
+                    'Enter keywords to search Markdown documents in this project.',
+                  )
+                "
+              />
+              <EmptyPanel
+                v-else-if="!searchRan"
+                :label="
+                  translate(
+                    '按回车或点击搜索查看结果。',
+                    'Press Enter or click Search to see results.',
+                  )
+                "
+              />
+              <EmptyPanel
+                v-else-if="searchRan && hits.length === 0"
+                :label="translate('没有找到匹配的内容。', 'No matching content found.')"
+              />
+              <button
+                v-for="hit in hits"
+                :key="`${hit.path}:${hit.offset}`"
+                class="mt-3 block w-full rounded-lg p-2 text-left hover:bg-slate-50"
+                @click.stop="jumpTo(hit.path, hit.offset, query.length)"
+              >
+                <div class="text-xs font-medium text-blue-600">
+                  {{ hit.path }}
+                </div>
+                <div class="mt-1 line-clamp-2 text-xs text-slate-600">
+                  {{ hit.excerpt }}
+                </div>
+              </button>
+            </div>
+            <div v-else-if="panel === 'terms'" class="min-h-0 flex-1 overflow-y-auto px-8 py-7">
+              <div class="reading-page mx-auto max-w-[860px]">
+                <div class="flex flex-wrap items-start justify-between gap-4">
+                  <h1>{{ translate('项目术语', 'Project terms') }}</h1>
+                  <button
+                    class="mt-8 flex items-center gap-1.5 rounded-md px-2 py-1 text-sm text-blue-600 hover:bg-blue-50"
+                    :title="translate('新建术语', 'New term')"
+                    @click.stop="termAction()"
+                  >
+                    <Plus :size="16" />{{ translate('新建术语', 'New term') }}
+                  </button>
+                </div>
+                <EmptyPanel
+                  v-if="data.terms.length === 0"
+                  :label="
+                    translate(
+                      '还没有术语。新建后，在文档中悬停同名词语即可查看解释。',
+                      'No terms yet. Create one, then hover over matching words in a document.',
+                    )
+                  "
+                />
+                <section
+                  v-for="term in data.terms"
+                  :id="`term-${term.id}`"
+                  :key="term.id"
+                  class="group mb-10 scroll-mt-10"
+                >
+                  <div class="flex items-start justify-between gap-4">
+                    <h2 :class="focusedTermId === term.id ? 'text-blue-700' : ''">
+                      {{ term.name }}
+                    </h2>
+                    <div class="flex shrink-0 items-center gap-1 text-slate-500">
+                      <button
+                        class="rounded-md p-1.5 hover:bg-slate-100"
+                        :title="translate('编辑术语', 'Edit term')"
+                        :aria-label="translate('编辑术语', 'Edit term')"
+                        @click.stop="termAction(term)"
+                      >
+                        <Pencil :size="15" />
+                      </button>
+                      <button
+                        class="rounded-md p-1.5 text-rose-600 hover:bg-slate-100"
+                        :title="translate('删除术语', 'Delete term')"
+                        :aria-label="translate('删除术语', 'Delete term')"
+                        @click.stop="removeTerm(term.id)"
+                      >
+                        <Trash2 :size="15" />
+                      </button>
+                    </div>
+                  </div>
+                  <p class="mt-3 whitespace-pre-wrap text-base leading-8 text-slate-600">
+                    {{ term.definition }}
+                  </p>
+                  <div
+                    v-for="exception in data.termExceptions.filter(
+                      (item) => item.termId === term.id,
+                    )"
+                    :key="exception.id"
+                    class="mt-3 text-sm leading-6 text-slate-500"
+                  >
+                    {{ exception.document }} ·
+                    {{ translate('此处已关闭解释', 'Definition hidden here') }}
+                    <button
+                      class="ml-2 text-blue-600"
+                      @click.stop="restoreTermException(exception)"
+                    >
+                      {{ translate('恢复', 'Restore') }}
+                    </button>
+                  </div>
+                </section>
+              </div>
+            </div>
+            <div v-else-if="panel === 'annotations'" class="min-h-0 overflow-y-auto p-3">
+              <div class="mb-3 flex gap-1">
+                <button
+                  v-for="kind in kinds"
+                  :key="kind.value"
+                  :class="[
+                    'rounded px-2 py-1 text-xs',
+                    annotationFilter === kind.value ? 'bg-blue-600 text-white' : 'bg-slate-100',
+                  ]"
+                  @click.stop="annotationFilter = kind.value"
+                >
+                  {{ kindLabel(kind.value) }}
+                </button>
+              </div>
+              <EmptyPanel
+                v-if="!data.annotations.some((item) => item.kind === annotationFilter)"
+                :label="
+                  translate(
+                    '暂无此类型标注。选中文档内容后可以添加。',
+                    'No annotations of this type. Select text in the document to add one.',
+                  )
+                "
+              />
+              <button
+                v-for="annotation in data.annotations.filter(
+                  (item) => item.kind === annotationFilter,
+                )"
+                :key="annotation.id"
+                class="mb-2 block w-full rounded-xl bg-slate-50 p-3 text-left hover:bg-slate-100"
+                @click.stop="
+                  jumpTo(
+                    annotation.document,
+                    annotation.offset,
+                    annotation.quote.length,
+                    annotation.id,
+                  )
+                "
+              >
+                <div class="text-xs font-medium text-blue-600">
+                  {{ annotation.document }}
+                </div>
+                <div class="mt-1 line-clamp-2 text-sm">
+                  {{ annotation.quote }}
+                </div>
+                <div class="mt-1 text-xs text-slate-500">
+                  {{ annotation.note }}
+                </div>
+                <div
+                  v-if="
+                    docs[annotation.document] &&
+                    locate(annotation, docs[annotation.document]?.content ?? '') === null
+                  "
+                  class="mt-1 text-xs text-amber-700"
+                >
+                  {{ translate('需重新定位', 'Needs relocation') }}
+                </div>
+              </button>
+            </div>
+            <div v-else-if="panel === 'history'" class="min-h-0 flex-1 overflow-y-auto px-8 py-7">
+              <div class="reading-page mx-auto max-w-[860px]">
+                <h1>{{ translate('AI 修改记录', 'AI edit history') }}</h1>
+                <LoadingState
+                  v-if="historyLoading"
+                  :label="translate('正在读取修改记录…', 'Loading edit history…')"
+                />
+                <EmptyPanel
+                  v-else-if="history.length === 0"
+                  :label="translate('暂无 AI 修改记录。', 'No AI edit history yet.')"
+                />
+                <section v-for="entry in history" :key="entry.id" class="mb-10">
+                  <h2 class="break-words">{{ entry.operation }}</h2>
+                  <p class="mt-1 break-all text-base leading-7">{{ entry.target }}</p>
+                  <p class="mt-1 text-sm text-slate-500">
+                    {{ new Date(entry.time * 1000).toLocaleString() }}
+                  </p>
+                  <details
+                    v-if="entry.beforeContent !== null || entry.afterContent !== null"
+                    class="mt-4"
+                  >
+                    <summary class="cursor-pointer text-sm text-blue-600">
+                      {{ translate('查看修改内容', 'View changes') }}
+                    </summary>
+                    <pre
+                      class="mt-3 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-50 p-4 text-xs leading-6"
+                      >{{ translate('修改前：', 'Before: ')
+                      }}{{ entry.beforeContent ?? translate('不存在', 'Not present') }}\n{{
+                        translate('修改后：', 'After: ')
+                      }}{{ entry.afterContent ?? translate('不存在', 'Not present') }}</pre>
+                  </details>
+                  <button
+                    class="mt-4 rounded-md px-2 py-1 text-sm text-blue-600 hover:bg-blue-50"
+                    @click.stop="undo(entry.id)"
+                  >
+                    {{ translate('撤销这次修改', 'Undo this change') }}
+                  </button>
+                </section>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </div>
     </div>
-  </main>
+    <div
+      v-if="message"
+      class="fixed right-5 top-16 z-[90] max-w-sm rounded-xl bg-slate-800 px-4 py-2 text-xs text-white shadow-xl"
+      role="status"
+    >
+      {{ message
+      }}<button
+        class="ml-3 rounded p-0.5 hover:bg-white/20"
+        :title="translate('关闭提示', 'Dismiss message')"
+        @click.stop="message = ''"
+      >
+        <X :size="13" />
+      </button>
+    </div>
+    <div
+      v-if="context"
+      class="fixed z-50 w-44 rounded-xl bg-white p-1 text-xs shadow-xl"
+      :style="{ left: `${contextAt.x}px`, top: `${contextAt.y}px` }"
+      @click.stop
+    >
+      <button
+        v-if="context.kind === 'directory'"
+        class="block w-full rounded px-2 py-1.5 text-left hover:bg-slate-100"
+        @click="
+          addDoc(context!.path);
+          context = null;
+        "
+      >
+        {{ translate('新建文档', 'New document') }}</button
+      ><button
+        v-if="context.kind === 'directory'"
+        class="block w-full rounded px-2 py-1.5 text-left hover:bg-slate-100"
+        @click="
+          addDir(context!.path);
+          context = null;
+        "
+      >
+        {{ translate('新建目录', 'New folder') }}</button
+      ><button
+        v-if="context.kind === 'document'"
+        class="block w-full rounded px-2 py-1.5 text-left hover:bg-slate-100"
+        @click="action('pin')"
+      >
+        {{
+          context.pinned ? translate('取消固定', 'Unpin') : translate('固定文档', 'Pin document')
+        }}</button
+      ><button
+        class="block w-full rounded px-2 py-1.5 text-left hover:bg-slate-100 disabled:opacity-40"
+        :disabled="!!context.lockSource && context.lockSource !== context.path"
+        @click="action('lock')"
+      >
+        {{
+          context.lockSource === context.path
+            ? translate('解锁', 'Unlock')
+            : translate('锁定', 'Lock')
+        }}</button
+      ><button
+        class="block w-full rounded px-2 py-1.5 text-left hover:bg-slate-100"
+        @click="action('rename')"
+      >
+        {{ translate('重命名', 'Rename') }}</button
+      ><button
+        class="block w-full rounded px-2 py-1.5 text-left hover:bg-slate-100"
+        @click="action('move')"
+      >
+        {{ translate('移动到…', 'Move to…') }}</button
+      ><button
+        class="block w-full rounded px-2 py-1.5 text-left text-rose-600 hover:bg-rose-50"
+        @click="action('delete')"
+      >
+        {{ translate('删除', 'Delete') }}
+      </button>
+    </div>
+    <div
+      v-if="hoveredTerm"
+      class="fixed z-40 w-64 rounded-xl bg-white p-3 text-sm shadow-xl"
+      :style="{ left: `${hoveredTerm.x}px`, top: `${hoveredTerm.y}px` }"
+      @mouseenter="keepTerm"
+      @mouseleave="scheduleHideTerm"
+      @click.stop
+    >
+      <div class="font-semibold">{{ hoveredTerm.term.name }}</div>
+      <p class="mt-1 whitespace-pre-wrap text-xs leading-5 text-slate-600">
+        {{ hoveredTerm.term.definition }}
+      </p>
+      <div class="mt-3 flex gap-3 text-xs text-blue-600">
+        <button @click.stop="viewTerm(hoveredTerm!.term)">
+          {{ translate('查看术语', 'View term') }}
+        </button>
+        <button v-if="hoveredTerm.offset !== null" @click.stop="disableTermHere">
+          {{ translate('关闭此处解释', 'Hide definition here') }}
+        </button>
+      </div>
+    </div>
+    <div
+      v-if="selectedAnnotation"
+      id="vivin-annotation-popover"
+      class="fixed z-50 w-80 max-w-[calc(100vw-24px)] rounded-xl bg-white p-4 text-sm shadow-xl ring-1 ring-slate-200/70"
+      :style="{
+        left: `${annotationPopoverAt.x}px`,
+        top: `${annotationPopoverAt.y}px`,
+      }"
+      role="group"
+      :aria-label="kindLabel(selectedAnnotation.kind)"
+      @mouseenter="keepAnnotationPopover"
+      @mouseleave="scheduleHideAnnotationPopover"
+      @click.stop
+    >
+      <div class="flex items-center justify-between gap-3">
+        <div class="flex items-center gap-2 font-semibold">
+          <i
+            class="h-2 w-2 rounded-full"
+            :style="{
+              background: kinds.find((kind) => kind.value === selectedAnnotation?.kind)?.color,
+            }"
+          />
+          {{ kindLabel(selectedAnnotation.kind) }}
+        </div>
+        <div class="flex items-center gap-1">
+          <button
+            v-if="!annotationEditing"
+            class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100"
+            :title="translate('编辑说明', 'Edit note')"
+            :aria-label="translate('编辑说明', 'Edit note')"
+            @click.stop="startAnnotationEdit"
+          >
+            <Pencil :size="15" />
+          </button>
+          <button
+            class="rounded-md p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+            :title="translate('删除标注', 'Delete annotation')"
+            :aria-label="translate('删除标注', 'Delete annotation')"
+            @click.stop="removeAnnotation(selectedAnnotation!)"
+          >
+            <Trash2 :size="15" />
+          </button>
+        </div>
+      </div>
+      <p class="mt-3 rounded-md bg-slate-50 px-2.5 py-2 text-sm leading-5">
+        {{ selectedAnnotation.quote }}
+      </p>
+      <p
+        v-if="!annotationEditing"
+        class="mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap text-sm leading-5 text-slate-600"
+      >
+        {{ selectedAnnotation.note || translate('无说明', 'No note') }}
+      </p>
+      <div v-else class="mt-3">
+        <textarea
+          id="vivin-annotation-note"
+          v-model="annotationDraft"
+          class="w-full resize-y rounded-lg bg-slate-50 p-2 text-sm leading-5 outline-none focus:ring-2 focus:ring-blue-200"
+          rows="3"
+          :aria-label="translate('标注说明', 'Annotation note')"
+          @keydown.esc.stop="annotationEditing = false"
+        />
+        <div class="mt-2 flex justify-end gap-2 text-xs">
+          <button
+            class="rounded-md px-2.5 py-1.5 text-slate-500 hover:bg-slate-100"
+            @click.stop="annotationEditing = false"
+          >
+            {{ translate('取消', 'Cancel') }}
+          </button>
+          <button
+            class="rounded-md bg-blue-600 px-2.5 py-1.5 text-white hover:bg-blue-700 disabled:opacity-50"
+            :disabled="annotationSaving"
+            @click.stop="updateAnnotation(selectedAnnotation!)"
+          >
+            {{ translate('保存', 'Save') }}
+          </button>
+        </div>
+      </div>
+    </div>
+    <div
+      v-if="dialog"
+      class="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/30"
+      @click.stop
+    >
+      <div
+        class="w-[min(420px,calc(100vw-32px))] rounded-2xl bg-white p-5 shadow-2xl"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="dialog.title"
+      >
+        <h2 class="text-base font-semibold">{{ dialog.title }}</h2>
+        <input
+          v-if="dialog.kind === 'text'"
+          id="vivin-dialog-input"
+          v-model="dialog.value"
+          class="mt-4 w-full rounded-lg bg-slate-100 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-200"
+          @keydown.enter.stop="finishDialog(true)"
+          @keydown.esc.stop="finishDialog(false)"
+        />
+        <div class="mt-5 flex justify-end gap-2 text-sm">
+          <button
+            class="rounded-lg px-3 py-1.5 hover:bg-slate-100"
+            @click.stop="finishDialog(false)"
+          >
+            {{ translate('取消', 'Cancel') }}
+          </button>
+          <button
+            class="rounded-lg bg-blue-600 px-3 py-1.5 text-white hover:bg-blue-700"
+            @click.stop="finishDialog(true)"
+          >
+            {{ translate('确定', 'Confirm') }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
 </template>

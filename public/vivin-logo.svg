@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 320" role="img" aria-labelledby="title description">
+  <title id="title">vivin</title>
+  <desc id="description">透明背景的 VI 几何标志和 vivin 字标。</desc>
+  <g transform="translate(0 0) scale(.28)">
+    <path d="M132 232h130l150 369 150-369h130L480 748c-27 65-109 65-136 0L132 232Z" fill="#102949" />
+    <rect x="758" y="232" width="126" height="552" rx="12" fill="#2879DB" />
+  </g>
+  <text x="315" y="225" fill="#102949" font-family="Avenir Next, Inter, Helvetica Neue, Arial, sans-serif" font-size="192" font-weight="700" letter-spacing="-12">vivin</text>
+</svg>

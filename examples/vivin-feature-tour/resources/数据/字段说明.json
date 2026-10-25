@@ -1,0 +1,5 @@
+{
+  "dataset": "演示条目",
+  "fields": ["id", "name", "amount"],
+  "note": "此文件只作为资源库条目显示"
+}

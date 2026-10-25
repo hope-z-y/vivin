@@ -6,3 +6,133 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 }
+
+.reading-page {
+  padding: 60px 8%;
+  font-family: 'Noto Sans', Arial, Helvetica, sans-serif;
+  font-size: 16px;
+}
+
+.reading-page h1,
+.reading-page h2 {
+  font-family: 'Noto Serif', Cambria, 'Times New Roman', Times, serif;
+  font-weight: 400;
+}
+
+.reading-page h1 {
+  margin-top: 32px;
+  font-size: 2.625em;
+  line-height: 1.1905;
+}
+
+.reading-page h2 {
+  font-size: 2.25em;
+  line-height: 1.2222;
+}
+
+.reading-page section:first-of-type {
+  margin-top: 48px;
+}
+
+.vivin-annotation {
+  border-radius: 2px;
+  box-decoration-break: clone;
+}
+
+.vivin-annotation-todo {
+  background: rgb(245 158 11 / 16%);
+  box-shadow: inset 0 -2px #d69e16;
+}
+.vivin-annotation-comment {
+  background: rgb(47 123 221 / 14%);
+  box-shadow: inset 0 -2px #2f7bdd;
+}
+.vivin-annotation-question {
+  background: rgb(136 86 203 / 14%);
+  box-shadow: inset 0 -2px #8856cb;
+}
+.vivin-annotation-error {
+  background: rgb(224 76 102 / 14%);
+  box-shadow: inset 0 -2px #e04c66;
+}
+
+.theme-dark {
+  color-scheme: dark;
+  background: #111925;
+  color: #e8eef7;
+}
+.theme-dark header,
+.theme-dark aside,
+.theme-dark [class*='bg-[#f3f6fa]'] {
+  background-color: #111925;
+}
+.theme-dark .bg-white,
+.theme-dark [class*='bg-white/80'] {
+  background-color: #1b2635;
+}
+.theme-dark .bg-slate-50,
+.theme-dark .bg-slate-100,
+.theme-dark [class~='bg-slate-200/70'] {
+  background-color: #263448;
+}
+.theme-dark .bg-blue-50 {
+  background-color: #243e60;
+}
+.theme-dark [class*='hover:bg-slate-200']:not([class*='bg-blue-600']):hover,
+.theme-dark [class*='hover:bg-slate-100']:not([class*='bg-blue-600']):hover {
+  background-color: #344760;
+}
+.theme-dark .text-slate-900,
+.theme-dark .text-slate-800,
+.theme-dark .text-slate-600 {
+  color: #e8eef7;
+}
+.theme-dark .text-slate-500,
+.theme-dark .text-slate-400 {
+  color: #a7b7ca;
+}
+.theme-dark .text-blue-600,
+.theme-dark .text-blue-700 {
+  color: #85b5ff;
+}
+.theme-dark button:not([class*='bg-blue']):hover {
+  background-color: rgb(255 255 255 / 8%);
+}
+.theme-dark .rendered-editor .milkdown {
+  --crepe-color-background: #1b2635;
+  --crepe-color-on-background: #e8eef7;
+  --crepe-color-surface: #263448;
+  --crepe-color-surface-low: #202d3d;
+  --crepe-color-on-surface: #e8eef7;
+  --crepe-color-on-surface-variant: #afbed0;
+  --crepe-color-outline: #60758d;
+  --crepe-color-primary: #a8caff;
+  --crepe-color-secondary: #344760;
+  --crepe-color-on-secondary: #e8eef7;
+  --crepe-color-inverse: #e8eef7;
+  --crepe-color-on-inverse: #1b2635;
+  --crepe-color-inline-code: #ff9a98;
+  --crepe-color-error: #ff9a98;
+  --crepe-color-hover: #344760;
+  --crepe-color-selected: #415570;
+  --crepe-color-inline-area: #344760;
+}
+.theme-dark .source-editor .cm-editor,
+.theme-dark .source-editor .cm-gutters,
+.theme-dark .milkdown .cm-editor,
+.theme-dark .milkdown .cm-gutters {
+  color: #e8eef7;
+  background: #1b2635;
+}
+.theme-dark .source-editor .cm-activeLine,
+.theme-dark .source-editor .cm-activeLineGutter {
+  background: #27384d;
+}
+.theme-dark .source-editor .cm-selectionBackground {
+  background: #385b87 !important;
+}
+.theme-dark .selection-annotation-toolbar,
+body:has(.theme-dark) .milkdown-toolbar {
+  background: #263448;
+  color: #e8eef7;
+}

@@ -195,6 +195,7 @@ const locale = ref<'zh' | 'en'>(
 const theme = ref<'light' | 'dark'>(
   readPreference<string>('vivin.theme', 'light') === 'dark' ? 'dark' : 'light',
 );
+const windowExpanded = ref(false);
 const split = ref(50);
 const busy = ref(false);
 const refreshing = ref(false);
@@ -935,6 +936,29 @@ function termOffsets(content: string, term: string): number[] {
   return offsets;
 }
 
+function termMarksFor(path: string) {
+  const content = docs.value[path]?.content ?? '';
+  const occupied: { start: number; end: number }[] = [];
+  return hoverTerms.value.flatMap((term) =>
+    termOffsets(content, term.name).flatMap((offset) => {
+      const end = offset + term.name.length;
+      if (
+        termException(term, path, offset) ||
+        occupied.some((range) => offset < range.end && end > range.start)
+      )
+        return [];
+      occupied.push({ start: offset, end });
+      return [{ id: term.id, offset, quote: term.name }];
+    }),
+  );
+}
+const termMarksByDocument = computed(() => {
+  const marks: Record<string, ReturnType<typeof termMarksFor>> = {};
+  for (const pane of panes.value)
+    if (pane.path && !marks[pane.path]) marks[pane.path] = termMarksFor(pane.path);
+  return marks;
+});
+
 function termException(term: Term, document: string, offset: number): TermException | undefined {
   const content = docs.value[document]?.content ?? '';
   return data.value.termExceptions.find(
@@ -951,68 +975,57 @@ function termException(term: Term, document: string, offset: number): TermExcept
 }
 
 function showTermHover(event: MouseEvent, pane: Pane) {
-  if (hideTermTimer) clearTimeout(hideTermTimer);
   const target = event.target;
+  if (!(target instanceof Element) || !pane.path) {
+    scheduleHideTerm();
+    return;
+  }
+  const mark = target.closest<HTMLElement>('[data-term-id][data-term-offset]');
+  if (!mark || target.closest('[data-annotation-id]')) {
+    scheduleHideTerm();
+    return;
+  }
+  const term = hoverTerms.value.find((item) => item.id === mark.dataset.termId);
+  const offset = Number(mark.dataset.termOffset);
+  if (!term || !Number.isInteger(offset)) {
+    scheduleHideTerm();
+    return;
+  }
+  keepTerm();
   if (
-    !(target instanceof Element) ||
-    !pane.path ||
-    target.closest('[data-annotation-id]') ||
-    !target.closest('.rendered-editor')
-  ) {
-    hoveredTerm.value = null;
+    hoveredTerm.value?.term.id === term.id &&
+    hoveredTerm.value?.document === pane.path &&
+    hoveredTerm.value?.offset === offset
+  )
     return;
-  }
-  const range = document.caretRangeFromPoint?.(event.clientX, event.clientY);
-  const node = range?.startContainer;
-  if (!node || node.nodeType !== Node.TEXT_NODE || !node.textContent) {
-    hoveredTerm.value = null;
-    return;
-  }
-  const text = node.textContent;
-  for (const term of hoverTerms.value) {
-    let start = text.indexOf(term.name);
-    while (start >= 0) {
-      if (range.startOffset >= start && range.startOffset <= start + term.name.length) {
-        const root = target.closest('.rendered-editor');
-        if (!root) break;
-        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-        let seen = 0;
-        let matchCount = 0;
-        while (walker.nextNode()) {
-          const candidate = walker.currentNode;
-          const matches = termOffsets(candidate.textContent ?? '', term.name);
-          if (candidate === node)
-            seen = matchCount + matches.filter((offset) => offset < start).length;
-          matchCount += matches.length;
-        }
-        const raw = termOffsets(docs.value[pane.path]?.content ?? '', term.name);
-        const offset = raw.length === matchCount ? (raw[seen] ?? null) : null;
-        if (offset !== null && termException(term, pane.path, offset)) {
-          hoveredTerm.value = null;
-          return;
-        }
-        hoveredTerm.value = {
-          term,
-          document: pane.path,
-          offset,
-          x: Math.max(12, Math.min(event.clientX + 12, window.innerWidth - 432)),
-          y: Math.max(12, Math.min(event.clientY + 16, window.innerHeight - 420)),
-        };
-        return;
-      }
-      start = text.indexOf(term.name, start + 1);
-    }
-  }
-  hoveredTerm.value = null;
+  const rect = mark.getBoundingClientRect();
+  hoveredTerm.value = { term, document: pane.path, offset, x: rect.left, y: rect.bottom + 6 };
+  void nextTick(() => {
+    if (hoveredTerm.value?.term.id !== term.id || hoveredTerm.value.offset !== offset) return;
+    const card = document.getElementById('vivin-term-popover');
+    if (!card) return;
+    hoveredTerm.value = {
+      ...hoveredTerm.value,
+      x: Math.max(12, Math.min(rect.left, window.innerWidth - card.offsetWidth - 12)),
+      y:
+        rect.bottom + 6 + card.offsetHeight <= window.innerHeight - 12
+          ? rect.bottom + 6
+          : Math.max(12, rect.top - card.offsetHeight - 6),
+    };
+  });
 }
 
 function scheduleHideTerm() {
+  if (!hoveredTerm.value) return;
+  if (hideTermTimer) clearTimeout(hideTermTimer);
   hideTermTimer = setTimeout(() => {
     hoveredTerm.value = null;
+    hideTermTimer = undefined;
   }, 220);
 }
 function keepTerm() {
   if (hideTermTimer) clearTimeout(hideTermTimer);
+  hideTermTimer = undefined;
 }
 async function disableTermHere() {
   const hover = hoveredTerm.value;
@@ -1160,18 +1173,26 @@ function toggleSplit() {
     });
 }
 function resize(event: PointerEvent) {
-  const host = (event.currentTarget as HTMLElement).parentElement;
+  const handle = event.currentTarget;
+  if (!(handle instanceof HTMLElement)) return;
+  const host = handle.parentElement;
   if (!host) return;
+  handle.setPointerCapture(event.pointerId);
   const move = (next: PointerEvent) => {
     const rect = host.getBoundingClientRect();
     split.value = Math.max(25, Math.min(75, (100 * (next.clientX - rect.left)) / rect.width));
   };
   const stop = () => {
-    window.removeEventListener('pointermove', move);
-    window.removeEventListener('pointerup', stop);
+    handle.removeEventListener('pointermove', move);
+    handle.removeEventListener('pointerup', stop);
+    handle.removeEventListener('pointercancel', stop);
+    handle.removeEventListener('lostpointercapture', stop);
+    if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
   };
-  window.addEventListener('pointermove', move);
-  window.addEventListener('pointerup', stop, { once: true });
+  handle.addEventListener('pointermove', move);
+  handle.addEventListener('pointerup', stop);
+  handle.addEventListener('pointercancel', stop);
+  handle.addEventListener('lostpointercapture', stop);
 }
 function shortcut(event: KeyboardEvent) {
   if (event.key === 'Escape' && dialog.value) {
@@ -1197,8 +1218,15 @@ function shortcut(event: KeyboardEvent) {
 onMounted(() => {
   window.addEventListener('keydown', shortcut);
   if (nativeAvailable()) {
+    const currentWindow = getCurrentWindow();
+    const syncWindowSize = async () => {
+      windowExpanded.value =
+        (await currentWindow.isFullscreen()) || (await currentWindow.isMaximized());
+    };
+    void syncWindowSize();
+    void currentWindow.onResized(() => void syncWindowSize()).then((stop) => unlisten.push(stop));
     void restoreLastProject();
-    void getCurrentWindow()
+    void currentWindow
       .onCloseRequested(async (event) => {
         if (closing || !dirty.value) return;
         event.preventDefault();
@@ -1305,6 +1333,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', shortcut);
   if (saveTimer) clearTimeout(saveTimer);
   if (diskTimer) clearInterval(diskTimer);
+  if (hideTermTimer) clearTimeout(hideTermTimer);
   if (hideAnnotationTimer) clearTimeout(hideAnnotationTimer);
   for (const stop of unlisten) stop();
 });
@@ -1313,7 +1342,10 @@ onBeforeUnmount(() => {
 <template>
   <div
     :class="[
-      'app-shell flex h-screen flex-col overflow-hidden bg-[#f3f6fa] text-slate-900',
+      'app-shell flex flex-col overflow-hidden bg-[#f3f6fa] text-slate-900',
+      windowExpanded
+        ? 'h-screen rounded-none'
+        : 'm-2 h-[calc(100vh-16px)] rounded-xl shadow-[0_4px_14px_-3px_rgb(15_23_42_/_18%)]',
       theme === 'dark' ? 'theme-dark' : '',
     ]"
     @click="
@@ -1677,7 +1709,7 @@ onBeforeUnmount(() => {
               <span class="min-w-0 flex-1 truncate">resources</span>
               <span class="text-xs text-slate-400">{{ resourceCount }}</span>
             </button>
-            <div v-if="resourceRootExpanded" class="max-h-36 overflow-y-auto">
+            <div v-if="resourceRootExpanded">
               <div v-if="resourceRows.length === 0" class="px-4 py-2 text-center">
                 <img src="/empty-list.svg" alt="" class="mx-auto mb-1 h-16 w-24" />
                 <p class="text-[11px] text-slate-400">
@@ -1748,13 +1780,16 @@ onBeforeUnmount(() => {
         </div>
       </aside>
       <div class="flex min-w-0 flex-1 flex-col">
-        <div class="relative flex min-h-0 flex-1 gap-3 px-4 pb-4">
+        <div
+          :class="windowExpanded ? 'gap-0' : 'gap-3 px-4 pb-4'"
+          class="relative flex min-h-0 flex-1"
+        >
           <div class="flex min-w-0 flex-1">
             <template v-for="(pane, index) in panes" :key="index"
               ><div
                 v-if="index === 1"
                 v-show="!readingPanel"
-                class="group flex w-2 shrink-0 cursor-col-resize items-center justify-center"
+                class="group flex w-2 shrink-0 touch-none cursor-col-resize items-center justify-center"
                 @pointerdown.prevent="resize"
               >
                 <div class="h-10 w-1 rounded bg-slate-300 group-hover:bg-blue-400" />
@@ -1764,10 +1799,11 @@ onBeforeUnmount(() => {
                 :data-pane-index="index"
                 :style="
                   panes.length === 2 && !readingPanel
-                    ? { width: index === 0 ? `${split}%` : `${100 - split}%` }
+                    ? { flex: `${index === 0 ? split : 100 - split} 1 0%` }
                     : {}
                 "
-                class="flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl bg-white"
+                :class="windowExpanded ? 'rounded-none' : 'rounded-2xl'"
+                class="flex min-w-0 flex-1 flex-col overflow-hidden bg-white"
                 @pointerdown="activePane = index"
                 @click.capture="handleEditorClick"
                 @mousemove="
@@ -1865,6 +1901,7 @@ onBeforeUnmount(() => {
                       :model-value="docs[pane.path]?.content ?? ''"
                       :document-path="pane.path"
                       :annotations="marksFor(pane.path)"
+                      :terms="termMarksByDocument[pane.path]"
                       :locale="locale"
                       class="min-w-0 flex-1"
                       @update:model-value="setContent(pane.path!, $event)"
@@ -2001,8 +2038,11 @@ onBeforeUnmount(() => {
           </div>
           <aside
             v-if="panel !== 'none' && project"
-            :class="readingPanel ? 'min-w-0 flex-1' : 'w-80 shrink-0'"
-            class="flex flex-col overflow-hidden rounded-2xl bg-white"
+            :class="[
+              readingPanel ? 'min-w-0 flex-1' : 'w-80 shrink-0',
+              windowExpanded ? 'rounded-none' : 'rounded-2xl',
+            ]"
+            class="flex flex-col overflow-hidden bg-white"
           >
             <div
               :class="readingPanel ? 'h-11 px-6 font-medium' : 'h-12 px-4 font-semibold'"
@@ -2322,6 +2362,7 @@ onBeforeUnmount(() => {
     </div>
     <div
       v-if="hoveredTerm"
+      id="vivin-term-popover"
       class="fixed z-40 flex max-h-[min(420px,calc(100vh-24px))] w-[420px] max-w-[calc(100vw-24px)] flex-col overflow-hidden rounded-xl bg-white p-3 text-sm shadow-xl"
       :style="{ left: `${hoveredTerm.x}px`, top: `${hoveredTerm.y}px` }"
       @mouseenter="keepTerm"
@@ -2339,7 +2380,7 @@ onBeforeUnmount(() => {
         }}{{ hoveredTermDetail.source.split('/').pop() }}
       </button>
       <p
-        class="mt-1 min-h-0 overflow-x-hidden overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-slate-600 [overflow-wrap:anywhere]"
+        class="mt-1 min-h-0 flex-auto overflow-x-hidden overflow-y-auto overscroll-contain whitespace-pre-wrap break-words text-xs leading-5 text-slate-600 [overflow-wrap:anywhere]"
       >
         {{ hoveredTermDetail.body }}
       </p>
@@ -2396,12 +2437,12 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </div>
-      <p class="mt-3 rounded-md bg-slate-50 px-2.5 py-2 text-sm leading-5">
+      <p class="mt-3 rounded-md bg-slate-50 px-2.5 py-2 text-sm leading-5 [overflow-wrap:anywhere]">
         {{ selectedAnnotation.quote }}
       </p>
       <p
         v-if="!annotationEditing"
-        class="mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap text-sm leading-5 text-slate-600"
+        class="mt-2 max-h-32 overflow-x-hidden overflow-y-auto whitespace-pre-wrap text-sm leading-5 text-slate-600 [overflow-wrap:anywhere]"
       >
         {{ selectedAnnotation.note || translate('无说明', 'No note') }}
       </p>

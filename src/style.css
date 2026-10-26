@@ -1,10 +1,60 @@
 @import 'tailwindcss';
 
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
 :root {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
+}
+
+.app-shell,
+.app-shell * {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+
+.app-shell ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.app-shell ::-webkit-scrollbar-track,
+.app-shell ::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.app-shell ::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: #cbd5e1;
+  background-clip: padding-box;
+}
+
+.app-shell ::-webkit-scrollbar-thumb:hover {
+  background-color: #94a3b8;
+}
+
+.theme-dark,
+.theme-dark * {
+  scrollbar-color: #526278 transparent;
+}
+
+.theme-dark ::-webkit-scrollbar-thumb {
+  background-color: #526278;
+}
+
+.theme-dark ::-webkit-scrollbar-thumb:hover {
+  background-color: #71839a;
 }
 
 .reading-page {
@@ -54,6 +104,24 @@
 .vivin-annotation-error {
   background: rgb(224 76 102 / 14%);
   box-shadow: inset 0 -2px #e04c66;
+}
+
+.vivin-term {
+  color: #2259a8;
+  text-decoration: underline dotted #5286ce;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+  cursor: help;
+  box-decoration-break: clone;
+}
+
+.vivin-term:hover {
+  background: rgb(82 134 206 / 12%);
+}
+
+.theme-dark .vivin-term {
+  color: #9dc5ff;
+  text-decoration-color: #85b5ff;
 }
 
 .theme-dark {

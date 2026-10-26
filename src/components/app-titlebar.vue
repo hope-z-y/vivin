@@ -10,6 +10,13 @@ async function runWindowAction(action: 'close' | 'minimize' | 'toggleMaximize') 
   if (!isTauri()) return;
   await getCurrentWindow()[action]();
 }
+
+async function toggleWindowSize() {
+  if (!isTauri()) return;
+  const currentWindow = getCurrentWindow();
+  if (isMac) await currentWindow.setFullscreen(!(await currentWindow.isFullscreen()));
+  else await currentWindow.toggleMaximize();
+}
 </script>
 
 <template>
@@ -37,11 +44,11 @@ async function runWindowAction(action: 'close' | 'minimize' | 'toggleMaximize') 
           @click="runWindowAction('minimize')"
         />
         <button
-          :aria-label="locale === 'en' ? 'Maximize window' : '最大化窗口'"
-          :title="locale === 'en' ? 'Maximize window' : '最大化窗口'"
+          :aria-label="locale === 'en' ? 'Toggle fullscreen' : '切换全屏'"
+          :title="locale === 'en' ? 'Toggle fullscreen' : '切换全屏'"
           class="h-3 w-3 rounded-full bg-[#28c840]"
           type="button"
-          @click="runWindowAction('toggleMaximize')"
+          @click="toggleWindowSize"
         />
       </div>
       <slot name="sidebar-control" />

@@ -19,6 +19,7 @@ const props = defineProps<{
   documentPath: string;
   readonly?: boolean;
   annotations?: AnnotationMark[];
+  terms?: { id: string; offset: number; quote: string }[];
   locale?: 'zh' | 'en';
 }>();
 const emit = defineEmits<{
@@ -181,6 +182,26 @@ const annotationPlugin = $prose(
               }),
             );
           }
+          for (const mark of props.terms ?? []) {
+            const rawMatches = occurrences(props.modelValue, mark.quote);
+            const renderedMatches = occurrences(rendered, mark.quote);
+            if (rawMatches.length !== renderedMatches.length) continue;
+            const rank = rawMatches.indexOf(mark.offset);
+            const start = rank < 0 ? undefined : renderedMatches[rank];
+            if (start === undefined) continue;
+            const from = positions[start];
+            const last = positions[start + mark.quote.length - 1];
+            if (from === undefined || last === undefined) continue;
+            const to = last + 1;
+            if (!state.doc.resolve(from).sameParent(state.doc.resolve(to))) continue;
+            decorations.push(
+              Decoration.inline(from, to, {
+                class: 'vivin-term',
+                'data-term-id': mark.id,
+                'data-term-offset': String(mark.offset),
+              }),
+            );
+          }
           return DecorationSet.create(state.doc, decorations);
         },
       },
@@ -331,6 +352,18 @@ watch(
   { deep: true },
 );
 
+watch(
+  () => props.terms,
+  () => {
+    if (!crepe) return;
+    crepe.editor.action((context) => {
+      const view = context.get(editorViewCtx);
+      view.dispatch(view.state.tr);
+    });
+  },
+  { deep: true },
+);
+
 onBeforeUnmount(() => {
   disposed = true;
   resolveReady();
@@ -341,7 +374,7 @@ onBeforeUnmount(() => {
 <template>
   <div
     ref="container"
-    class="rendered-editor h-full min-w-0 overflow-auto px-8 py-7"
+    class="rendered-editor h-full min-w-0 overflow-x-hidden overflow-y-auto px-8 py-7"
     @click.capture="openLink"
   />
 </template>
@@ -349,7 +382,7 @@ onBeforeUnmount(() => {
 <style>
 .rendered-editor .milkdown {
   margin: 0 auto;
-  max-width: 860px;
+  max-width: 100%;
   min-height: 100%;
   box-shadow: none;
 }

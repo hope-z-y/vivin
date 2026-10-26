@@ -96,7 +96,6 @@ const MarkdownSourceEditor = defineAsyncComponent({
 });
 
 type Mode = 'source' | 'rendered';
-const largeDocumentThreshold = 150_000;
 type SidePanel = 'none' | 'search' | 'terms' | 'annotations' | 'history';
 interface DocState extends Document {
   savedContent: string;
@@ -157,6 +156,7 @@ const expandedResources = ref(new Set<string>());
 const resourceRootExpanded = ref(true);
 const data = shallowRef<ProjectData>(emptyData());
 const docs = ref<Record<string, DocState>>({});
+const markContents = shallowRef<Record<string, string>>({});
 const panes = ref<Pane[]>([emptyPane()]);
 const activePane = ref(0);
 const expanded = ref(new Set<string>());
@@ -292,6 +292,7 @@ let pendingJump: PendingJump | null = null;
 const draftSequences = new Map<string, number>();
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 const draftTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const markTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let diskTimer: ReturnType<typeof setInterval> | undefined;
 let hideTermTimer: ReturnType<typeof setTimeout> | undefined;
 let hideAnnotationTimer: ReturnType<typeof setTimeout> | undefined;
@@ -396,6 +397,13 @@ function remember(doc: Document) {
     conflict: false,
     saving: false,
   };
+  markContents.value = { ...markContents.value, [doc.path]: doc.content };
+}
+
+function clearMarkTimers() {
+  for (const timer of markTimers.values()) clearTimeout(timer);
+  markTimers.clear();
+  markContents.value = {};
 }
 
 async function switchProject(create: boolean) {
@@ -446,6 +454,7 @@ function activateProject(next: ProjectInfo) {
   resources.value = [];
   data.value = emptyData();
   docs.value = {};
+  clearMarkTimers();
   draftSequences.clear();
   paneRequestIds.clear();
   loadingPanes.value.clear();
@@ -527,19 +536,9 @@ async function openDoc(path: string, paneIndex = activePane.value) {
     if (paneRequestIds.get(paneIndex) !== requestId) return;
     const pane = panes.value[paneIndex];
     if (!pane) return;
-    const switchingDocument = pane.path !== path;
     pane.path = path;
     if (lockSource(path) || path === 'AGENTS.md') pane.mode = 'source';
-    else if (
-      switchingDocument &&
-      (docs.value[path]?.content.length ?? 0) >= largeDocumentThreshold
-    ) {
-      pane.mode = 'source';
-      message.value = translate(
-        '文档较大，已使用更流畅的原文模式；仍可手动切换排版模式。',
-        'Large document opened in faster source mode. You can still switch to rendered mode.',
-      );
-    }
+    else pane.mode = 'rendered';
     activePane.value = paneIndex;
     panel.value = 'none';
   } catch (error) {
@@ -556,12 +555,7 @@ async function openReference(sourceDocument: string, href: string) {
     const createdSplit = panes.value.length === 1;
     if (createdSplit) toggleSplit();
     await openDoc(result.path, 1);
-    if (
-      createdSplit &&
-      panes.value[1]?.path === result.path &&
-      (docs.value[result.path]?.content.length ?? 0) < largeDocumentThreshold
-    )
-      panes.value[1].mode = 'rendered';
+    if (createdSplit && panes.value[1]?.path === result.path) panes.value[1].mode = 'rendered';
   } catch (error) {
     report(error);
   }
@@ -629,6 +623,16 @@ function setContent(path: string, content: string) {
   const doc = docs.value[path];
   if (!doc || lockSource(path) || doc.content === content) return;
   doc.content = content;
+  const previousMarkTimer = markTimers.get(path);
+  if (previousMarkTimer) clearTimeout(previousMarkTimer);
+  markTimers.set(
+    path,
+    setTimeout(() => {
+      markTimers.delete(path);
+      if (docs.value[path] !== doc) return;
+      markContents.value = { ...markContents.value, [path]: doc.content };
+    }, 250),
+  );
   if (path !== 'AGENTS.md' && nativeAvailable()) {
     const previousTimer = draftTimers.get(path);
     if (previousTimer) clearTimeout(previousTimer);
@@ -942,7 +946,7 @@ const annotationMarksByDocument = computed(() => {
   for (const pane of panes.value) {
     if (!pane.path || marks[pane.path]) continue;
     marks[pane.path] = annotationMarks(
-      docs.value[pane.path]?.content ?? '',
+      markContents.value[pane.path] ?? docs.value[pane.path]?.content ?? '',
       data.value.annotations.filter((item) => item.document === pane.path),
     );
   }
@@ -1029,7 +1033,7 @@ function termOffsets(content: string, term: string): number[] {
 }
 
 function termMarksFor(path: string) {
-  const content = docs.value[path]?.content ?? '';
+  const content = markContents.value[path] ?? docs.value[path]?.content ?? '';
   const ignored = new Set<string>();
   for (const exception of data.value.termExceptions) {
     if (exception.document !== path) continue;
@@ -1414,6 +1418,7 @@ onMounted(() => {
       resourceRootExpanded.value = true;
       data.value = emptyData();
       docs.value = {};
+      clearMarkTimers();
       draftSequences.clear();
       paneRequestIds.clear();
       loadingPanes.value.clear();

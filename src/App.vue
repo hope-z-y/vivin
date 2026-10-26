@@ -89,6 +89,11 @@ const MarkdownRenderedEditor = defineAsyncComponent({
   loadingComponent: LoadingState,
   delay: 0,
 });
+const MarkdownVirtualEditor = defineAsyncComponent({
+  loader: () => import('./components/markdown-virtual-editor.vue'),
+  loadingComponent: LoadingState,
+  delay: 0,
+});
 const MarkdownSourceEditor = defineAsyncComponent({
   loader: () => import('./components/markdown-source-editor.vue'),
   loadingComponent: LoadingState,
@@ -96,6 +101,7 @@ const MarkdownSourceEditor = defineAsyncComponent({
 });
 
 type Mode = 'source' | 'rendered';
+const virtualDocumentThreshold = 80_000;
 type SidePanel = 'none' | 'search' | 'terms' | 'annotations' | 'history';
 interface DocState extends Document {
   savedContent: string;
@@ -1171,6 +1177,15 @@ function viewTerm(term: Term) {
     document.getElementById(`term-${term.id}`)?.scrollIntoView({ block: 'center' }),
   );
 }
+function requestEditorAnnotation(
+  paneIndex: number,
+  kind: AnnotationKind,
+  selected: { quote: string; offset: number },
+) {
+  activePane.value = paneIndex;
+  void addAnnotation(kind, selected);
+}
+
 async function addAnnotation(
   kind: AnnotationKind,
   selectedOverride?: { quote: string; offset: number },
@@ -1185,10 +1200,10 @@ async function addAnnotation(
   if (!selected && pane?.mode === 'rendered') {
     const selection = window.getSelection();
     const range = selection && !selection.isCollapsed ? selection.getRangeAt(0) : null;
-    const rendered = document.querySelector(
-      `[data-pane-index="${activePane.value}"] .rendered-editor`,
-    );
-    if (range && rendered?.contains(range.commonAncestorContainer)) {
+    const rendered = Array.from(
+      document.querySelectorAll(`[data-pane-index="${activePane.value}"] .rendered-editor`),
+    ).find((element) => range && element.contains(range.commonAncestorContainer));
+    if (range && rendered) {
       const quote = selection?.toString() ?? '';
       const walker = document.createTreeWalker(rendered, NodeFilter.SHOW_TEXT);
       let allText = '';
@@ -1198,12 +1213,15 @@ async function addAnnotation(
         if (node === range.startContainer) startAt = allText.length + range.startOffset;
         allText += node.textContent ?? '';
       }
-      const raw = termOffsets(doc.content, quote);
+      const segment = rendered.closest<HTMLElement>('[data-segment-start]');
+      const segmentStart = Number(segment?.dataset.segmentStart ?? 0);
+      const segmentEnd = Number(segment?.dataset.segmentEnd ?? doc.content.length);
+      const raw = termOffsets(doc.content.slice(segmentStart, segmentEnd), quote);
       const visible = termOffsets(allText, quote);
       const rank = visible.indexOf(startAt);
       if (quote && rank >= 0 && raw.length === visible.length && raw[rank] !== undefined)
-        selected = { quote, offset: raw[rank] };
-      else if (quote && raw.length === 1) selected = { quote, offset: raw[0]! };
+        selected = { quote, offset: segmentStart + raw[rank] };
+      else if (quote && raw.length === 1) selected = { quote, offset: segmentStart + raw[0]! };
     }
   }
   if (!selected?.quote) {
@@ -2078,9 +2096,14 @@ onBeforeUnmount(() => {
                             addAnnotation(kind, selected);
                           }
                         "
-                      /><MarkdownRenderedEditor
+                      /><component
                         v-else
-                        :key="`${index}:${pane.path}:rendered:${locale}`"
+                        :is="
+                          (docs[pane.path]?.content.length ?? 0) >= virtualDocumentThreshold
+                            ? MarkdownVirtualEditor
+                            : MarkdownRenderedEditor
+                        "
+                        :key="`${index}:${pane.path}:rendered:${locale}:${(docs[pane.path]?.content.length ?? 0) >= virtualDocumentThreshold ? 'virtual' : 'single'}`"
                         :ref="(value) => setRenderedEditor(value, index)"
                         :model-value="docs[pane.path]?.content ?? ''"
                         :document-path="pane.path"
@@ -2092,10 +2115,8 @@ onBeforeUnmount(() => {
                         @error="message = $event"
                         @open-reference="openReference(pane.path!, $event)"
                         @annotation-request="
-                          (kind, selected) => {
-                            activePane = index;
-                            addAnnotation(kind, selected);
-                          }
+                          (kind: AnnotationKind, selected: { quote: string; offset: number }) =>
+                            requestEditorAnnotation(index, kind, selected)
                         "
                         @incompatible="
                           pane.mode = 'source';

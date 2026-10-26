@@ -11,6 +11,7 @@
     "lint": "oxlint . --deny-warnings",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
+    "test:segments": "node --experimental-strip-types --test tests/markdown-segments.test.mjs",
     "check": "pnpm typecheck && pnpm lint && pnpm format:check",
     "tauri": "tauri"
   },

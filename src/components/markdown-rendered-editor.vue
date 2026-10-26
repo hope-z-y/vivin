@@ -24,6 +24,8 @@ const props = defineProps<{
   annotations?: AnnotationMark[];
   terms?: { id: string; offset: number; quote: string }[];
   locale?: 'zh' | 'en';
+  embedded?: boolean;
+  deferMermaid?: boolean;
 }>();
 const emit = defineEmits<{
   'update:modelValue': [value: string];
@@ -31,6 +33,7 @@ const emit = defineEmits<{
   error: [message: string];
   'annotation-request': [kind: AnnotationKind, selection: { quote: string; offset: number }];
   'open-reference': [href: string];
+  ready: [];
 }>();
 
 const container = ref<HTMLDivElement>();
@@ -57,7 +60,7 @@ function mermaidPreview(
   applyPreview: (value: null | string | HTMLElement) => void,
 ): null | string | void {
   if (language.toLowerCase() !== 'mermaid' || !content.trim()) return null;
-  if (props.modelValue.length < 100_000)
+  if (!props.deferMermaid && props.modelValue.length < 100_000)
     return renderMermaidPreview(language, content, applyPreview);
   const cached = getCachedMermaidPreview(content);
   if (cached) return cached;
@@ -466,6 +469,7 @@ onMounted(async () => {
     crepe = instance;
     applyingExternalChange = false;
     editorReady.value = true;
+    emit('ready');
   } finally {
     resolveReady();
   }
@@ -519,13 +523,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="relative h-full min-w-0">
+  <div class="relative min-w-0" :class="embedded ? '' : 'h-full'">
     <div
       ref="container"
-      class="rendered-editor h-full min-w-0 overflow-x-hidden overflow-y-auto px-8 py-7 transition-opacity duration-150"
+      class="rendered-editor min-w-0 overflow-x-hidden transition-opacity duration-150"
       :class="[
         editorReady ? 'opacity-100' : 'opacity-0',
-        modelValue.length >= 100_000 ? 'rendered-editor-large' : '',
+        embedded ? 'rendered-editor-embedded' : 'h-full overflow-y-auto px-8 py-7',
+        !embedded && modelValue.length >= 100_000 ? 'rendered-editor-large' : '',
       ]"
       @click.capture="handleRenderedClick"
       @scroll.passive="keepHorizontalPosition"
@@ -546,9 +551,17 @@ onBeforeUnmount(() => {
   box-shadow: none;
 }
 
+.rendered-editor-embedded .milkdown {
+  min-height: 0;
+}
+
 .rendered-editor .milkdown .ProseMirror {
   padding: 60px 8%;
   overflow-x: clip;
+}
+
+.rendered-editor-embedded .milkdown .ProseMirror {
+  padding: 8px 8%;
 }
 
 .rendered-editor-large .milkdown .ProseMirror > .milkdown-table-block {

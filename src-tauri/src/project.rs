@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::sync::Mutex;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
@@ -153,6 +155,37 @@ pub fn open_project_resource(
     app.opener()
         .open_path(canonical.to_string_lossy(), None::<&str>)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn reveal_project_entry(
+    path: Option<String>,
+    state: State<'_, ProjectSession>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let root = state.root()?;
+    let target = match path {
+        Some(path) => checked_member(&root, &path)?,
+        None => root,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open")
+            .arg("-R")
+            .arg(&target)
+            .status()
+            .map_err(|error| error.to_string())?;
+        if !status.success() {
+            return Err("Finder 无法显示该项目文件".to_string());
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    app.opener()
+        .open_path(target.to_string_lossy(), None::<&str>)
+        .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    let _ = app;
+    Ok(())
 }
 
 impl ProjectSession {
@@ -601,6 +634,21 @@ pub fn read_document(path: String, state: State<'_, ProjectSession>) -> Result<D
         revision: revision(&content),
         content,
     })
+}
+
+#[tauri::command]
+pub fn read_document_revision(
+    path: String,
+    state: State<'_, ProjectSession>,
+) -> Result<String, String> {
+    let root = state.root()?;
+    let absolute = if path == "AGENTS.md" {
+        checked_rules(&root)?
+    } else {
+        checked_document(&root, &path)?
+    };
+    let content = fs::read_to_string(absolute).map_err(|error| error.to_string())?;
+    Ok(revision(&content))
 }
 
 #[tauri::command]

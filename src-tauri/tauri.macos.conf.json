@@ -3,10 +3,7 @@
     "windows": [
       {
         "title": "vivin",
-        "decorations": true,
-        "titleBarStyle": "Overlay",
-        "trafficLightPosition": { "x": 22, "y": 20 },
-        "hiddenTitle": true,
+        "decorations": false,
         "transparent": true,
         "shadow": false,
         "dragDropEnabled": false,

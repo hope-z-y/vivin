@@ -30,12 +30,14 @@ import {
   onBeforeUnmount,
   onMounted,
   ref,
+  shallowRef,
   watch,
 } from 'vue';
 import AppTitlebar from './components/app-titlebar.vue';
 import EmptyPanel from './components/empty-panel.vue';
 import LoadingState from './components/loading-state.vue';
 import { annotationMarks, resolveAnnotation } from './lib/annotation-anchor';
+import { createTextMatcher } from './lib/text-matcher';
 import {
   bridgeInfo,
   chooseProject,
@@ -57,7 +59,9 @@ import {
   openProjectResource,
   publishDraft,
   readDocument,
+  readDocumentRevision,
   readProjectRules,
+  revealProjectEntry,
   saveDocument,
   saveProjectRules,
   searchDocuments,
@@ -92,6 +96,7 @@ const MarkdownSourceEditor = defineAsyncComponent({
 });
 
 type Mode = 'source' | 'rendered';
+const largeDocumentThreshold = 150_000;
 type SidePanel = 'none' | 'search' | 'terms' | 'annotations' | 'history';
 interface DocState extends Document {
   savedContent: string;
@@ -150,7 +155,7 @@ const tree = ref<TreeNode[]>([]);
 const resources = ref<ResourceNode[]>([]);
 const expandedResources = ref(new Set<string>());
 const resourceRootExpanded = ref(true);
-const data = ref<ProjectData>(emptyData());
+const data = shallowRef<ProjectData>(emptyData());
 const docs = ref<Record<string, DocState>>({});
 const panes = ref<Pane[]>([emptyPane()]);
 const activePane = ref(0);
@@ -256,6 +261,7 @@ const dialog = ref<{
   title: string;
   value: string;
 } | null>(null);
+const termDialog = ref<{ id: string | null; name: string; definition: string } | null>(null);
 let dialogResolve: ((value: string | boolean | null) => void) | null = null;
 function finishDialog(accepted: boolean) {
   const active = dialog.value;
@@ -285,12 +291,14 @@ let revealToken = 0;
 let pendingJump: PendingJump | null = null;
 const draftSequences = new Map<string, number>();
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
+const draftTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let diskTimer: ReturnType<typeof setInterval> | undefined;
 let hideTermTimer: ReturnType<typeof setTimeout> | undefined;
 let hideAnnotationTimer: ReturnType<typeof setTimeout> | undefined;
 let annotationAnchor: Element | null = null;
 const unlisten: UnlistenFn[] = [];
 let closing = false;
+let closePromptActive = false;
 
 const activePath = computed(() => panes.value[activePane.value]?.path ?? null);
 const current = computed(() => (activePath.value ? docs.value[activePath.value] : null));
@@ -497,17 +505,41 @@ async function restoreLastProject() {
   }
 }
 async function openDoc(path: string, paneIndex = activePane.value) {
+  if (
+    panes.value[paneIndex]?.path === path &&
+    docs.value[path] &&
+    !loadingPanes.value.has(paneIndex)
+  ) {
+    activePane.value = paneIndex;
+    panel.value = 'none';
+    return;
+  }
   const requestId = (paneRequestIds.get(paneIndex) ?? 0) + 1;
   paneRequestIds.set(paneIndex, requestId);
   loadingPanes.value.add(paneIndex);
   try {
     if (!docs.value[path])
       remember(path === 'AGENTS.md' ? await readProjectRules() : await readDocument(path));
+    await nextTick();
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
     if (paneRequestIds.get(paneIndex) !== requestId) return;
     const pane = panes.value[paneIndex];
     if (!pane) return;
+    const switchingDocument = pane.path !== path;
     pane.path = path;
     if (lockSource(path) || path === 'AGENTS.md') pane.mode = 'source';
+    else if (
+      switchingDocument &&
+      (docs.value[path]?.content.length ?? 0) >= largeDocumentThreshold
+    ) {
+      pane.mode = 'source';
+      message.value = translate(
+        '文档较大，已使用更流畅的原文模式；仍可手动切换排版模式。',
+        'Large document opened in faster source mode. You can still switch to rendered mode.',
+      );
+    }
     activePane.value = paneIndex;
     panel.value = 'none';
   } catch (error) {
@@ -524,7 +556,12 @@ async function openReference(sourceDocument: string, href: string) {
     const createdSplit = panes.value.length === 1;
     if (createdSplit) toggleSplit();
     await openDoc(result.path, 1);
-    if (createdSplit && panes.value[1]?.path === result.path) panes.value[1].mode = 'rendered';
+    if (
+      createdSplit &&
+      panes.value[1]?.path === result.path &&
+      (docs.value[result.path]?.content.length ?? 0) < largeDocumentThreshold
+    )
+      panes.value[1].mode = 'rendered';
   } catch (error) {
     report(error);
   }
@@ -590,16 +627,25 @@ function setRenderedEditor(value: unknown, index: number) {
 }
 function setContent(path: string, content: string) {
   const doc = docs.value[path];
-  if (!doc || lockSource(path)) return;
+  if (!doc || lockSource(path) || doc.content === content) return;
   doc.content = content;
   if (path !== 'AGENTS.md' && nativeAvailable()) {
+    const previousTimer = draftTimers.get(path);
+    if (previousTimer) clearTimeout(previousTimer);
     const sequence = (draftSequences.get(path) ?? 0) + 1;
     draftSequences.set(path, sequence);
-    void publishDraft(path, content, doc.revision, sequence).catch((error) => {
-      if (draftSequences.get(path) !== sequence) return;
-      doc.conflict = true;
-      report(error);
-    });
+    draftTimers.set(
+      path,
+      setTimeout(() => {
+        draftTimers.delete(path);
+        if (docs.value[path] !== doc || doc.content !== content) return;
+        void publishDraft(path, content, doc.revision, sequence).catch((error) => {
+          if (draftSequences.get(path) !== sequence) return;
+          doc.conflict = true;
+          report(error);
+        });
+      }, 750),
+    );
   }
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
@@ -610,6 +656,10 @@ async function saveOne(path: string) {
   const doc = docs.value[path];
   if (!doc || doc.saving || doc.conflict || doc.content === doc.savedContent || lockSource(path))
     return;
+  const draftTimer = draftTimers.get(path);
+  if (draftTimer) clearTimeout(draftTimer);
+  draftTimers.delete(path);
+  draftSequences.set(path, (draftSequences.get(path) ?? 0) + 1);
   doc.saving = true;
   const submitted = doc.content;
   try {
@@ -648,10 +698,11 @@ async function checkDisk() {
   if (!project.value) return;
   for (const doc of Object.values(docs.value)) {
     if (doc.conflict || doc.saving) continue;
+    const expectedRevision = doc.revision;
     try {
-      const disk =
-        doc.path === 'AGENTS.md' ? await readProjectRules() : await readDocument(doc.path);
-      if (disk.revision !== doc.revision) doc.conflict = true;
+      const revision = await readDocumentRevision(doc.path);
+      if (!doc.saving && doc.revision === expectedRevision && revision !== expectedRevision)
+        doc.conflict = true;
     } catch {
       /* A later user action reports an inaccessible file. */
     }
@@ -727,6 +778,16 @@ function showContext(event: MouseEvent, node: TreeNode) {
     x: Math.min(event.clientX, window.innerWidth - 180),
     y: Math.min(event.clientY, window.innerHeight - 250),
   };
+}
+async function showInFinder(path?: string) {
+  context.value = null;
+  projectMenu.value = false;
+  more.value = false;
+  try {
+    await revealProjectEntry(path ?? null);
+  } catch (error) {
+    report(error);
+  }
 }
 async function action(kind: 'rename' | 'move' | 'delete' | 'pin' | 'lock') {
   const node = context.value;
@@ -842,12 +903,20 @@ async function showBridgeInfo() {
   }
 }
 async function termAction(term?: Term) {
-  const name = await requestText(translate('术语名称', 'Term name'), term?.name ?? '');
-  if (!name) return;
-  const definition = await requestText(translate('解释', 'Definition'), term?.definition ?? '');
-  if (definition === null) return;
+  termDialog.value = {
+    id: term?.id ?? null,
+    name: term?.name ?? '',
+    definition: term?.definition ?? '',
+  };
+  await nextTick();
+  document.getElementById('vivin-term-name')?.focus();
+}
+async function saveTermDialog() {
+  const draft = termDialog.value;
+  if (!draft || !draft.name.trim()) return;
   try {
-    await upsertTerm(term?.id ?? null, name, definition);
+    await upsertTerm(draft.id, draft.name, draft.definition);
+    termDialog.value = null;
     await refresh();
   } catch (error) {
     report(error);
@@ -868,12 +937,17 @@ function count(kind: AnnotationKind) {
 function locate(annotation: Annotation, content: string): number | null {
   return resolveAnnotation(content, annotation);
 }
-function marksFor(path: string) {
-  return annotationMarks(
-    docs.value[path]?.content ?? '',
-    data.value.annotations.filter((item) => item.document === path),
-  );
-}
+const annotationMarksByDocument = computed(() => {
+  const marks: Record<string, ReturnType<typeof annotationMarks>> = {};
+  for (const pane of panes.value) {
+    if (!pane.path || marks[pane.path]) continue;
+    marks[pane.path] = annotationMarks(
+      docs.value[pane.path]?.content ?? '',
+      data.value.annotations.filter((item) => item.document === pane.path),
+    );
+  }
+  return marks;
+});
 function positionAnnotationPopover() {
   if (!annotationAnchor?.isConnected || !selectedAnnotation.value) return;
   const rect = annotationAnchor.getBoundingClientRect();
@@ -935,33 +1009,70 @@ function handleEditorClick(event: MouseEvent) {
   if (annotation && mark) showAnnotationPopover(annotation, mark);
 }
 
+const matchTerms = computed(() =>
+  createTextMatcher(
+    hoverTerms.value.map((term, priority) => ({ text: term.name, value: { term, priority } })),
+  ),
+);
+
 function termOffsets(content: string, term: string): number[] {
+  if (!term) return [];
   const offsets: number[] = [];
   let from = 0;
   while (from < content.length) {
     const found = content.indexOf(term, from);
     if (found < 0) break;
     offsets.push(found);
-    from = found + Math.max(1, term.length);
+    from = found + term.length;
   }
   return offsets;
 }
 
 function termMarksFor(path: string) {
   const content = docs.value[path]?.content ?? '';
+  const ignored = new Set<string>();
+  for (const exception of data.value.termExceptions) {
+    if (exception.document !== path) continue;
+    const term = data.value.terms.find((item) => item.id === exception.termId);
+    if (!term) continue;
+    const offset = resolveAnnotation(content, {
+      ...exception,
+      kind: 'comment',
+      quote: term.name,
+      note: '',
+    });
+    if (offset !== null) ignored.add(`${term.id}:${offset}`);
+  }
   const occupied: { start: number; end: number }[] = [];
-  return hoverTerms.value.flatMap((term) =>
-    termOffsets(content, term.name).flatMap((offset) => {
-      const end = offset + term.name.length;
-      if (
-        termException(term, path, offset) ||
-        occupied.some((range) => offset < range.end && end > range.start)
-      )
-        return [];
-      occupied.push({ start: offset, end });
-      return [{ id: term.id, offset, quote: term.name }];
-    }),
-  );
+  const lastEndByTerm = new Map<string, number>();
+  const marks: { id: string; offset: number; quote: string }[] = [];
+  const candidates = matchTerms
+    .value(content)
+    .sort(
+      (left, right) => left.value.priority - right.value.priority || left.offset - right.offset,
+    );
+  for (const {
+    value: { term },
+    offset,
+    length,
+  } of candidates) {
+    const end = offset + length;
+    if (offset < (lastEndByTerm.get(term.id) ?? 0)) continue;
+    lastEndByTerm.set(term.id, end);
+    if (ignored.has(`${term.id}:${offset}`)) continue;
+    let left = 0;
+    let right = occupied.length;
+    while (left < right) {
+      const middle = (left + right) >>> 1;
+      if ((occupied[middle]?.start ?? 0) < offset) left = middle + 1;
+      else right = middle;
+    }
+    if ((occupied[left - 1]?.end ?? 0) > offset || (occupied[left]?.start ?? Infinity) < end)
+      continue;
+    occupied.splice(left, 0, { start: offset, end });
+    marks.push({ id: term.id, offset, quote: term.name });
+  }
+  return marks;
 }
 const termMarksByDocument = computed(() => {
   const marks: Record<string, ReturnType<typeof termMarksFor>> = {};
@@ -969,21 +1080,6 @@ const termMarksByDocument = computed(() => {
     if (pane.path && !marks[pane.path]) marks[pane.path] = termMarksFor(pane.path);
   return marks;
 });
-
-function termException(term: Term, document: string, offset: number): TermException | undefined {
-  const content = docs.value[document]?.content ?? '';
-  return data.value.termExceptions.find(
-    (exception) =>
-      exception.document === document &&
-      exception.termId === term.id &&
-      resolveAnnotation(content, {
-        ...exception,
-        kind: 'comment',
-        quote: term.name,
-        note: '',
-      }) === offset,
-  );
-}
 
 function showTermHover(event: MouseEvent, pane: Pane) {
   const target = event.target;
@@ -1267,30 +1363,42 @@ onMounted(() => {
     void restoreLastProject();
     void currentWindow
       .onCloseRequested(async (event) => {
-        if (closing || !dirty.value) return;
+        if (closing) return;
+        if (!dirty.value && !closePromptActive) return;
         event.preventDefault();
-        if (
-          !(await confirmAction(
-            translate(
-              '有未保存的内容，保存后关闭窗口吗？',
-              'You have unsaved changes. Save and close?',
-            ),
-          ))
-        )
-          return;
-        await saveAll();
-        if (
-          dirty.value &&
-          !(await confirmAction(
-            translate(
-              '部分内容仍未保存，确定丢弃并关闭吗？',
-              'Some changes are still unsaved. Discard and close?',
-            ),
-          ))
-        )
-          return;
-        closing = true;
-        await getCurrentWindow().close();
+        if (closePromptActive) return;
+        closePromptActive = true;
+        try {
+          if (
+            !(await confirmAction(
+              translate(
+                '有未保存的内容，保存后关闭窗口吗？',
+                'You have unsaved changes. Save and close?',
+              ),
+            ))
+          )
+            return;
+          await saveAll();
+          if (
+            dirty.value &&
+            !(await confirmAction(
+              translate(
+                '部分内容仍未保存，确定丢弃并关闭吗？',
+                'Some changes are still unsaved. Discard and close?',
+              ),
+            ))
+          )
+            return;
+          closing = true;
+          try {
+            await currentWindow.close();
+          } catch (error) {
+            closing = false;
+            report(error);
+          }
+        } finally {
+          closePromptActive = false;
+        }
       })
       .then((stop) => unlisten.push(stop));
     void listen<ProjectInfo>('vivin://project-opened', (event) => {
@@ -1372,6 +1480,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', shortcut);
   window.removeEventListener('resize', clampSidebarOnWindowResize);
   if (saveTimer) clearTimeout(saveTimer);
+  for (const timer of draftTimers.values()) clearTimeout(timer);
   if (diskTimer) clearInterval(diskTimer);
   if (hideTermTimer) clearTimeout(hideTermTimer);
   if (hideAnnotationTimer) clearTimeout(hideAnnotationTimer);
@@ -1574,6 +1683,11 @@ onBeforeUnmount(() => {
                 "
               >
                 {{ translate('编辑项目规则', 'Edit project rules') }}</button
+              ><button
+                class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
+                @click.stop="showInFinder()"
+              >
+                {{ translate('在 Finder 中显示项目', 'Show project in Finder') }}</button
               ><button
                 class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
                 @click.stop="
@@ -1875,221 +1989,216 @@ onBeforeUnmount(() => {
                   scheduleHideAnnotationPopover();
                 "
               >
-                <LoadingState
-                  v-if="loadingPanes.has(index)"
-                  :label="translate('正在打开文档…', 'Opening document…')"
-                />
-                <template v-else-if="pane.path && docs[pane.path]"
-                  ><div class="flex h-11 shrink-0 items-center justify-between px-6 text-sm">
-                    <span
-                      :class="[
-                        'truncate font-medium',
-                        index === activePane && panes.length === 2 ? 'text-blue-700' : '',
-                      ]"
-                      >{{ pane.path
-                      }}<span
-                        v-if="docs[pane.path]?.content !== docs[pane.path]?.savedContent"
-                        class="ml-1 text-blue-500"
-                        >•</span
-                      ></span
-                    ><span
-                      v-if="lockSource(pane.path)"
-                      class="ml-2 flex shrink-0 items-center gap-1 text-xs text-amber-700"
-                      ><LockKeyhole :size="13" />{{
-                        lockSource(pane.path) === pane.path
-                          ? translate('已锁定', 'Locked')
-                          : translate(
-                              `由 ${lockSource(pane.path)} 锁定`,
-                              `Locked by ${lockSource(pane.path)}`,
-                            )
-                      }}</span
-                    >
-                  </div>
+                <Transition name="document-switch" mode="out-in">
+                  <LoadingState
+                    v-if="loadingPanes.has(index)"
+                    :label="translate('正在打开文档…', 'Opening document…')"
+                  />
                   <div
-                    v-if="docs[pane.path]?.conflict"
-                    class="flex flex-wrap items-center gap-2 bg-amber-50 px-4 py-2 text-xs text-amber-900"
+                    v-else-if="pane.path && docs[pane.path]"
+                    :key="`${pane.path}:${pane.mode}`"
+                    class="flex min-h-0 flex-1 flex-col"
                   >
-                    <span>{{
-                      translate(
-                        '磁盘上的文档已改变，自动保存已暂停。',
-                        'The document changed on disk. Autosave is paused.',
-                      )
-                    }}</span
-                    ><button class="underline" @click.stop="reload(pane.path!)">
-                      {{ translate('重新加载磁盘版本', 'Reload disk version') }}</button
-                    ><button
-                      v-if="pane.path !== 'AGENTS.md'"
-                      class="underline"
-                      @click.stop="saveCopy(pane.path!)"
-                    >
-                      {{
-                        translate(
-                          '将当前内容另存为新文档',
-                          'Save current content as a new document',
-                        )
-                      }}
-                    </button>
-                  </div>
-                  <div class="flex min-h-0 flex-1">
-                    <MarkdownSourceEditor
-                      v-if="
-                        pane.mode === 'source' ||
-                        !!lockSource(pane.path) ||
-                        pane.path === 'AGENTS.md'
-                      "
-                      :key="`${index}:${pane.path}:source`"
-                      :ref="(value) => setSourceEditor(value, index)"
-                      :model-value="docs[pane.path]?.content ?? ''"
-                      :document-path="pane.path"
-                      :reveal-request="sourceRevealRequests[index] ?? undefined"
-                      :annotations="marksFor(pane.path)"
-                      :readonly="!!lockSource(pane.path)"
-                      :locale="locale"
-                      class="min-w-0 flex-1"
-                      @update:model-value="setContent(pane.path!, $event)"
-                      @error="message = $event"
-                      @annotation-request="
-                        (kind, selected) => {
-                          activePane = index;
-                          addAnnotation(kind, selected);
-                        }
-                      "
-                    /><MarkdownRenderedEditor
-                      v-else
-                      :key="`${index}:${pane.path}:rendered:${locale}`"
-                      :ref="(value) => setRenderedEditor(value, index)"
-                      :model-value="docs[pane.path]?.content ?? ''"
-                      :document-path="pane.path"
-                      :annotations="marksFor(pane.path)"
-                      :terms="termMarksByDocument[pane.path]"
-                      :locale="locale"
-                      class="min-w-0 flex-1"
-                      @update:model-value="setContent(pane.path!, $event)"
-                      @error="message = $event"
-                      @open-reference="openReference(pane.path!, $event)"
-                      @annotation-request="
-                        (kind, selected) => {
-                          activePane = index;
-                          addAnnotation(kind, selected);
-                        }
-                      "
-                      @incompatible="
-                        pane.mode = 'source';
-                        message = translate(
-                          '排版模式无法完整保留此 Markdown，已切回原文模式',
-                          'Rendered mode cannot preserve this Markdown; switched to source mode',
-                        );
-                      "
-                    />
-                    <div
-                      v-if="pane.path !== 'AGENTS.md'"
-                      class="relative flex w-8 shrink-0 flex-col items-center py-2"
-                    >
-                      <div class="group relative mb-2">
-                        <button
-                          :title="translate('筛选缩略图标注', 'Filter annotation minimap')"
-                          class="rounded p-1 hover:bg-slate-100"
-                        >
-                          <ChevronDown :size="13" />
-                        </button>
-                        <div
-                          class="absolute right-6 top-0 z-20 hidden w-24 rounded-lg bg-white p-1 text-xs shadow-lg group-hover:block"
-                        >
-                          <button
-                            v-for="kind in kinds"
-                            :key="kind.value"
-                            class="block w-full rounded px-2 py-1 text-left hover:bg-slate-100"
-                            @click.stop="
-                              pane.filters = pane.filters.includes(kind.value)
-                                ? pane.filters.filter((value) => value !== kind.value)
-                                : [...pane.filters, kind.value]
-                            "
-                          >
-                            {{ pane.filters.includes(kind.value) ? '✓' : '　' }}
-                            {{ kindLabel(kind.value) }}
-                          </button>
-                        </div>
-                      </div>
-                      <button
-                        v-for="annotation in data.annotations.filter(
-                          (item) =>
-                            item.document === pane.path &&
-                            pane.filters.includes(item.kind) &&
-                            locate(item, docs[pane.path]?.content ?? '') !== null,
-                        )"
-                        :key="annotation.id"
-                        :aria-label="`${kindLabel(annotation.kind)}: ${annotation.quote}`"
-                        class="group absolute left-1 flex h-5 w-6 -translate-y-1/2 items-center justify-center rounded hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
-                        :style="{
-                          top: `${Math.max(12, Math.min(95, (100 * (locate(annotation, docs[pane.path]?.content ?? '') ?? 0)) / Math.max(1, docs[pane.path]?.content.length ?? 1)))}%`,
-                        }"
-                        @click.stop="
-                          jumpTo(
-                            annotation.document,
-                            locate(annotation, docs[annotation.document]?.content ?? '') ??
-                              annotation.offset,
-                            annotation.quote.length,
-                            annotation.id,
-                          )
-                        "
+                    <div class="flex h-11 shrink-0 items-center justify-between px-6 text-sm">
+                      <span
+                        :class="[
+                          'truncate font-medium',
+                          index === activePane && panes.length === 2 ? 'text-blue-700' : '',
+                        ]"
+                        >{{ pane.path
+                        }}<span
+                          v-if="docs[pane.path]?.content !== docs[pane.path]?.savedContent"
+                          class="ml-1 text-blue-500"
+                          >•</span
+                        ></span
+                      ><span
+                        v-if="lockSource(pane.path)"
+                        class="ml-2 flex shrink-0 items-center gap-1 text-xs text-amber-700"
+                        ><LockKeyhole :size="13" />{{
+                          lockSource(pane.path) === pane.path
+                            ? translate('已锁定', 'Locked')
+                            : translate(
+                                `由 ${lockSource(pane.path)} 锁定`,
+                                `Locked by ${lockSource(pane.path)}`,
+                              )
+                        }}</span
                       >
-                        <span
-                          class="h-[3px] w-3.5 rounded-full transition-all group-hover:w-5"
+                    </div>
+                    <div
+                      v-if="docs[pane.path]?.conflict"
+                      class="flex flex-wrap items-center gap-2 bg-amber-50 px-4 py-2 text-xs text-amber-900"
+                    >
+                      <span>{{
+                        translate(
+                          '磁盘上的文档已改变，自动保存已暂停。',
+                          'The document changed on disk. Autosave is paused.',
+                        )
+                      }}</span
+                      ><button class="underline" @click.stop="reload(pane.path!)">
+                        {{ translate('重新加载磁盘版本', 'Reload disk version') }}</button
+                      ><button
+                        v-if="pane.path !== 'AGENTS.md'"
+                        class="underline"
+                        @click.stop="saveCopy(pane.path!)"
+                      >
+                        {{
+                          translate(
+                            '将当前内容另存为新文档',
+                            'Save current content as a new document',
+                          )
+                        }}
+                      </button>
+                    </div>
+                    <div class="flex min-h-0 flex-1">
+                      <MarkdownSourceEditor
+                        v-if="
+                          pane.mode === 'source' ||
+                          !!lockSource(pane.path) ||
+                          pane.path === 'AGENTS.md'
+                        "
+                        :key="`${index}:${pane.path}:source`"
+                        :ref="(value) => setSourceEditor(value, index)"
+                        :model-value="docs[pane.path]?.content ?? ''"
+                        :document-path="pane.path"
+                        :reveal-request="sourceRevealRequests[index] ?? undefined"
+                        :annotations="annotationMarksByDocument[pane.path]"
+                        :readonly="!!lockSource(pane.path)"
+                        :locale="locale"
+                        class="min-w-0 flex-1"
+                        @update:model-value="setContent(pane.path!, $event)"
+                        @error="message = $event"
+                        @annotation-request="
+                          (kind, selected) => {
+                            activePane = index;
+                            addAnnotation(kind, selected);
+                          }
+                        "
+                      /><MarkdownRenderedEditor
+                        v-else
+                        :key="`${index}:${pane.path}:rendered:${locale}`"
+                        :ref="(value) => setRenderedEditor(value, index)"
+                        :model-value="docs[pane.path]?.content ?? ''"
+                        :document-path="pane.path"
+                        :annotations="annotationMarksByDocument[pane.path]"
+                        :terms="termMarksByDocument[pane.path]"
+                        :locale="locale"
+                        class="min-w-0 flex-1"
+                        @update:model-value="setContent(pane.path!, $event)"
+                        @error="message = $event"
+                        @open-reference="openReference(pane.path!, $event)"
+                        @annotation-request="
+                          (kind, selected) => {
+                            activePane = index;
+                            addAnnotation(kind, selected);
+                          }
+                        "
+                        @incompatible="
+                          pane.mode = 'source';
+                          message = translate(
+                            '排版模式无法完整保留此 Markdown，已切回原文模式',
+                            'Rendered mode cannot preserve this Markdown; switched to source mode',
+                          );
+                        "
+                      />
+                      <div
+                        v-if="pane.path !== 'AGENTS.md'"
+                        class="relative flex w-8 shrink-0 flex-col items-center py-2"
+                      >
+                        <div class="group relative mb-2">
+                          <button
+                            :title="translate('筛选缩略图标注', 'Filter annotation minimap')"
+                            class="rounded p-1 hover:bg-slate-100"
+                          >
+                            <ChevronDown :size="13" />
+                          </button>
+                          <div
+                            class="absolute right-6 top-0 z-20 hidden w-24 rounded-lg bg-white p-1 text-xs shadow-lg group-hover:block"
+                          >
+                            <button
+                              v-for="kind in kinds"
+                              :key="kind.value"
+                              class="block w-full rounded px-2 py-1 text-left hover:bg-slate-100"
+                              @click.stop="
+                                pane.filters = pane.filters.includes(kind.value)
+                                  ? pane.filters.filter((value) => value !== kind.value)
+                                  : [...pane.filters, kind.value]
+                              "
+                            >
+                              {{ pane.filters.includes(kind.value) ? '✓' : '　' }}
+                              {{ kindLabel(kind.value) }}
+                            </button>
+                          </div>
+                        </div>
+                        <button
+                          v-for="mark in (annotationMarksByDocument[pane.path] ?? []).filter(
+                            (item) => pane.filters.includes(item.kind),
+                          )"
+                          :key="mark.id"
+                          :aria-label="`${kindLabel(mark.kind)}: ${mark.quote}`"
+                          class="group absolute left-1 flex h-5 w-6 -translate-y-1/2 items-center justify-center rounded hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
                           :style="{
-                            background: kinds.find((kind) => kind.value === annotation.kind)?.color,
+                            top: `${Math.max(12, Math.min(95, (100 * mark.offset) / Math.max(1, docs[pane.path]?.content.length ?? 1)))}%`,
                           }"
-                        />
-                        <span
-                          class="pointer-events-none absolute right-7 top-1/2 z-30 w-max max-w-56 -translate-y-1/2 break-words whitespace-normal rounded-lg bg-slate-900 px-2.5 py-1.5 text-left text-xs leading-5 text-white opacity-0 shadow-lg group-hover:opacity-100 group-focus-visible:opacity-100"
-                          >{{ annotation.quote }}</span
+                          @click.stop="jumpTo(pane.path, mark.offset, mark.length, mark.id)"
                         >
+                          <span
+                            class="h-[3px] w-3.5 rounded-full transition-all group-hover:w-5"
+                            :style="{
+                              background: kinds.find((kind) => kind.value === mark.kind)?.color,
+                            }"
+                          />
+                          <span
+                            class="pointer-events-none absolute right-7 top-1/2 z-30 w-max max-w-56 -translate-y-1/2 break-words whitespace-normal rounded-lg bg-slate-900 px-2.5 py-1.5 text-left text-xs leading-5 text-white opacity-0 shadow-lg group-hover:opacity-100 group-focus-visible:opacity-100"
+                            >{{ mark.quote }}</span
+                          >
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-else class="flex flex-1 items-center justify-center px-8 text-center">
+                    <div class="max-w-xs">
+                      <img
+                        src="/empty-writing.svg"
+                        alt=""
+                        class="mx-auto mb-5 h-44 w-60 object-contain"
+                      />
+                      <h1 class="text-lg font-semibold tracking-tight">
+                        {{
+                          !project
+                            ? translate('开始写作', 'Start writing')
+                            : rows.length === 0
+                              ? translate('项目里还没有文档', 'No documents in this project')
+                              : translate('选择一篇文档', 'Choose a document')
+                        }}
+                      </h1>
+                      <p class="mt-2 text-sm leading-6 text-slate-400">
+                        {{
+                          !project
+                            ? translate(
+                                '点击右上角的 +，新建项目或打开已有文件夹。',
+                                'Use + at the top right to create a project or open an existing folder.',
+                              )
+                            : rows.length === 0
+                              ? translate(
+                                  '新建一篇 Markdown 文档，内容会保存在项目文件夹中。',
+                                  'Create a Markdown document. It will be saved in the project folder.',
+                                )
+                              : translate(
+                                  '从左侧项目文件中选择文档，或新建一篇。',
+                                  'Choose a document on the left, or create one.',
+                                )
+                        }}
+                      </p>
+                      <button
+                        v-if="project && rows.length === 0"
+                        class="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700"
+                        @click.stop="addDoc()"
+                      >
+                        {{ translate('新建文档', 'New document') }}
                       </button>
                     </div>
                   </div>
-                </template>
-                <div v-else class="flex flex-1 items-center justify-center px-8 text-center">
-                  <div class="max-w-xs">
-                    <img
-                      src="/empty-writing.svg"
-                      alt=""
-                      class="mx-auto mb-5 h-44 w-60 object-contain"
-                    />
-                    <h1 class="text-lg font-semibold tracking-tight">
-                      {{
-                        !project
-                          ? translate('开始写作', 'Start writing')
-                          : rows.length === 0
-                            ? translate('项目里还没有文档', 'No documents in this project')
-                            : translate('选择一篇文档', 'Choose a document')
-                      }}
-                    </h1>
-                    <p class="mt-2 text-sm leading-6 text-slate-400">
-                      {{
-                        !project
-                          ? translate(
-                              '点击右上角的 +，新建项目或打开已有文件夹。',
-                              'Use + at the top right to create a project or open an existing folder.',
-                            )
-                          : rows.length === 0
-                            ? translate(
-                                '新建一篇 Markdown 文档，内容会保存在项目文件夹中。',
-                                'Create a Markdown document. It will be saved in the project folder.',
-                              )
-                            : translate(
-                                '从左侧项目文件中选择文档，或新建一篇。',
-                                'Choose a document on the left, or create one.',
-                              )
-                      }}
-                    </p>
-                    <button
-                      v-if="project && rows.length === 0"
-                      class="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700"
-                      @click.stop="addDoc()"
-                    >
-                      {{ translate('新建文档', 'New document') }}
-                    </button>
-                  </div>
-                </div>
+                </Transition>
               </section></template
             >
           </div>
@@ -2402,6 +2511,11 @@ onBeforeUnmount(() => {
         }}</button
       ><button
         class="block w-full rounded px-2 py-1.5 text-left hover:bg-slate-100"
+        @click="showInFinder(context!.path)"
+      >
+        {{ translate('在 Finder 中显示', 'Show in Finder') }}</button
+      ><button
+        class="block w-full rounded px-2 py-1.5 text-left hover:bg-slate-100"
         @click="action('rename')"
       >
         {{ translate('重命名', 'Rename') }}</button
@@ -2523,6 +2637,55 @@ onBeforeUnmount(() => {
             class="rounded-md bg-blue-600 px-2.5 py-1.5 text-white hover:bg-blue-700 disabled:opacity-50"
             :disabled="annotationSaving"
             @click.stop="updateAnnotation(selectedAnnotation!)"
+          >
+            {{ translate('保存', 'Save') }}
+          </button>
+        </div>
+      </div>
+    </div>
+    <div
+      v-if="termDialog"
+      class="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/30"
+      @click.stop
+    >
+      <div
+        class="w-[min(520px,calc(100vw-32px))] rounded-2xl bg-white p-5 shadow-2xl"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="translate('编辑项目术语', 'Edit project term')"
+      >
+        <h2 class="text-base font-semibold">
+          {{
+            termDialog.id ? translate('编辑术语', 'Edit term') : translate('新建术语', 'New term')
+          }}
+        </h2>
+        <label class="mt-4 block text-sm text-slate-600" for="vivin-term-name">
+          {{ translate('术语名称', 'Term name') }}
+        </label>
+        <input
+          id="vivin-term-name"
+          v-model="termDialog.name"
+          class="mt-1 w-full rounded-lg bg-slate-100 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-200"
+          @keydown.esc.stop="termDialog = null"
+        />
+        <label class="mt-4 block text-sm text-slate-600" for="vivin-term-definition">
+          {{ translate('解释', 'Definition') }}
+        </label>
+        <textarea
+          id="vivin-term-definition"
+          v-model="termDialog.definition"
+          rows="7"
+          class="mt-1 w-full resize-y rounded-lg bg-slate-100 px-3 py-2 text-sm leading-6 outline-none focus:ring-2 focus:ring-blue-200"
+          @keydown.esc.stop="termDialog = null"
+        />
+        <div class="mt-5 flex justify-end gap-2 text-sm">
+          <button class="rounded-lg px-3 py-1.5 hover:bg-slate-100" @click.stop="termDialog = null">
+            {{ translate('取消', 'Cancel') }}
+          </button>
+          <button
+            class="rounded-lg bg-blue-600 px-3 py-1.5 text-white hover:bg-blue-700 disabled:opacity-40"
+            :disabled="!termDialog.name.trim()"
+            @click.stop="saveTermDialog"
           >
             {{ translate('保存', 'Save') }}
           </button>

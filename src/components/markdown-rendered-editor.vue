@@ -10,8 +10,10 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { AnnotationMark } from '../lib/annotation-anchor';
 import type { AnnotationKind } from '../lib/project-api';
 import { equivalentMarkdown } from '../lib/markdown-roundtrip';
+import { createTextMatcher } from '../lib/text-matcher';
 import { renderMermaidPreview } from '../lib/mermaid-preview';
 import { importImage, readProjectImage } from '../lib/project-api';
+import LoadingState from './loading-state.vue';
 import '@milkdown/crepe/theme/common/style.css';
 import '@milkdown/crepe/theme/frame.css';
 
@@ -32,6 +34,7 @@ const emit = defineEmits<{
 }>();
 
 const container = ref<HTMLDivElement>();
+const editorReady = ref(false);
 let crepe: Crepe | undefined;
 let applyingExternalChange = true;
 let disposed = false;
@@ -134,88 +137,166 @@ function requestAnnotation(kind: AnnotationKind, context: Ctx) {
   emit('annotation-request', kind, { quote, offset });
 }
 
-const annotationPlugin = $prose(
-  () =>
-    new Plugin({
-      props: {
-        nodeViews: {
-          image(node) {
-            const image = document.createElement('img');
-            const apply = (src: string, alt: string) => {
-              image.alt = alt;
-              void proxyImage(src).then((url) => {
-                image.src = url;
-              });
-            };
-            apply(String(node.attrs.src ?? ''), String(node.attrs.alt ?? ''));
-            return {
-              dom: image,
-              update(next) {
-                if (next.type !== node.type) return false;
-                apply(String(next.attrs.src ?? ''), String(next.attrs.alt ?? ''));
-                return true;
-              },
-              ignoreMutation: () => true,
-            };
-          },
-        },
-        decorations(state) {
-          const positions: number[] = [];
-          let rendered = '';
-          state.doc.descendants((node, position) => {
-            if (!node.isText || !node.text) return;
-            rendered += node.text;
-            for (let index = 0; index < node.text.length; index++) positions.push(position + index);
-          });
-          const decorations: ReturnType<typeof Decoration.inline>[] = [];
-          for (const mark of props.annotations ?? []) {
-            const rawMatches = occurrences(props.modelValue, mark.quote);
-            const renderedMatches = occurrences(rendered, mark.quote);
-            if (rawMatches.length !== renderedMatches.length) continue;
-            const rank = rawMatches.indexOf(mark.offset);
-            const start = rank < 0 ? undefined : renderedMatches[rank];
-            if (start === undefined) continue;
-            const from = positions[start];
-            const last = positions[start + mark.quote.length - 1];
-            if (from === undefined || last === undefined) continue;
-            const to = last + 1;
-            if (!state.doc.resolve(from).sameParent(state.doc.resolve(to))) continue;
-            decorations.push(
-              Decoration.inline(from, to, {
-                class: `vivin-annotation vivin-annotation-${mark.kind}`,
-                'data-annotation-id': mark.id,
-              }),
-            );
-          }
-          for (const mark of props.terms ?? []) {
-            const rawMatches = occurrences(props.modelValue, mark.quote);
-            const renderedMatches = occurrences(rendered, mark.quote);
-            if (rawMatches.length !== renderedMatches.length) continue;
-            const rank = rawMatches.indexOf(mark.offset);
-            const start = rank < 0 ? undefined : renderedMatches[rank];
-            if (start === undefined) continue;
-            const from = positions[start];
-            const last = positions[start + mark.quote.length - 1];
-            if (from === undefined || last === undefined) continue;
-            const to = last + 1;
-            if (!state.doc.resolve(from).sameParent(state.doc.resolve(to))) continue;
-            decorations.push(
-              Decoration.inline(from, to, {
-                class: 'vivin-term',
-                'data-term-id': mark.id,
-                'data-term-offset': String(mark.offset),
-              }),
-            );
-          }
-          return DecorationSet.create(state.doc, decorations);
+const annotationPlugin = $prose(() => {
+  let cachedDoc: object | undefined;
+  let cachedMarkdown: string | undefined;
+  let cachedAnnotations: AnnotationMark[] | undefined;
+  let cachedTerms: typeof props.terms;
+  let cachedDecorations: DecorationSet | undefined;
+  let cachedRendered = '';
+  let textRuns: { start: number; end: number; position: number }[] = [];
+  let indexedDoc: object | undefined;
+  const positionAt = (offset: number): number | undefined => {
+    let left = 0;
+    let right = textRuns.length - 1;
+    while (left <= right) {
+      const middle = (left + right) >>> 1;
+      const run = textRuns[middle];
+      if (!run) return undefined;
+      if (offset < run.start) right = middle - 1;
+      else if (offset >= run.end) left = middle + 1;
+      else return run.position + offset - run.start;
+    }
+    return undefined;
+  };
+  return new Plugin({
+    props: {
+      nodeViews: {
+        image(node) {
+          const image = document.createElement('img');
+          const apply = (src: string, alt: string) => {
+            image.alt = alt;
+            void proxyImage(src).then((url) => {
+              image.src = url;
+            });
+          };
+          apply(String(node.attrs.src ?? ''), String(node.attrs.alt ?? ''));
+          return {
+            dom: image,
+            update(next) {
+              if (next.type !== node.type) return false;
+              apply(String(next.attrs.src ?? ''), String(next.attrs.alt ?? ''));
+              return true;
+            },
+            ignoreMutation: () => true,
+          };
         },
       },
-    }),
-);
+      decorations(state) {
+        if (
+          cachedDecorations &&
+          cachedDoc === state.doc &&
+          cachedMarkdown === props.modelValue &&
+          cachedAnnotations === props.annotations &&
+          cachedTerms === props.terms
+        )
+          return cachedDecorations;
+        if (indexedDoc !== state.doc) {
+          textRuns = [];
+          const renderedChunks: string[] = [];
+          let renderedLength = 0;
+          state.doc.descendants((node, position) => {
+            if (!node.isText || !node.text) return;
+            textRuns.push({
+              start: renderedLength,
+              end: renderedLength + node.text.length,
+              position,
+            });
+            renderedChunks.push(node.text);
+            renderedLength += node.text.length;
+          });
+          cachedRendered = renderedChunks.join('');
+          indexedDoc = state.doc;
+        }
+        const quotes = [
+          ...new Set(
+            [...(props.annotations ?? []), ...(props.terms ?? [])].map((mark) => mark.quote),
+          ),
+        ];
+        const matchQuotes = createTextMatcher(
+          quotes.map((quote) => ({ text: quote, value: quote })),
+        );
+        const rawRanks = new Map<string, Map<number, number>>();
+        const renderedOccurrences = new Map<string, number[]>();
+        const rawEnds = new Map<string, number>();
+        for (const match of matchQuotes(props.modelValue)) {
+          if (match.offset < (rawEnds.get(match.value) ?? 0)) continue;
+          rawEnds.set(match.value, match.offset + match.length);
+          let ranks = rawRanks.get(match.value);
+          if (!ranks) {
+            ranks = new Map();
+            rawRanks.set(match.value, ranks);
+          }
+          ranks.set(match.offset, ranks.size);
+        }
+        const renderedEnds = new Map<string, number>();
+        for (const match of matchQuotes(cachedRendered)) {
+          if (match.offset < (renderedEnds.get(match.value) ?? 0)) continue;
+          renderedEnds.set(match.value, match.offset + match.length);
+          let positions = renderedOccurrences.get(match.value);
+          if (!positions) {
+            positions = [];
+            renderedOccurrences.set(match.value, positions);
+          }
+          positions.push(match.offset);
+        }
+        const visibleOffset = (quote: string, rawOffset: number): number | undefined => {
+          const ranks = rawRanks.get(quote);
+          const rendered = renderedOccurrences.get(quote);
+          if (!ranks || !rendered || ranks.size !== rendered.length) return undefined;
+          const rank = ranks.get(rawOffset);
+          return rank === undefined ? undefined : rendered[rank];
+        };
+        const decorations: ReturnType<typeof Decoration.inline>[] = [];
+        for (const mark of props.annotations ?? []) {
+          const start = visibleOffset(mark.quote, mark.offset);
+          if (start === undefined) continue;
+          const from = positionAt(start);
+          const last = positionAt(start + mark.quote.length - 1);
+          if (from === undefined || last === undefined) continue;
+          const to = last + 1;
+          if (!state.doc.resolve(from).sameParent(state.doc.resolve(to))) continue;
+          decorations.push(
+            Decoration.inline(from, to, {
+              class: `vivin-annotation vivin-annotation-${mark.kind}`,
+              'data-annotation-id': mark.id,
+            }),
+          );
+        }
+        for (const mark of props.terms ?? []) {
+          const start = visibleOffset(mark.quote, mark.offset);
+          if (start === undefined) continue;
+          const from = positionAt(start);
+          const last = positionAt(start + mark.quote.length - 1);
+          if (from === undefined || last === undefined) continue;
+          const to = last + 1;
+          if (!state.doc.resolve(from).sameParent(state.doc.resolve(to))) continue;
+          decorations.push(
+            Decoration.inline(from, to, {
+              class: 'vivin-term',
+              'data-term-id': mark.id,
+              'data-term-offset': String(mark.offset),
+            }),
+          );
+        }
+        cachedDecorations = DecorationSet.create(state.doc, decorations);
+        cachedDoc = state.doc;
+        cachedMarkdown = props.modelValue;
+        cachedAnnotations = props.annotations;
+        cachedTerms = props.terms;
+        return cachedDecorations;
+      },
+    },
+  });
+});
 
 onMounted(async () => {
   try {
     if (!container.value) return;
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+    if (disposed) return;
     const instance = new Crepe({
       root: container.value,
       defaultValue: props.modelValue,
@@ -337,6 +418,7 @@ onMounted(async () => {
     instance.setReadonly(Boolean(props.readonly));
     crepe = instance;
     applyingExternalChange = false;
+    editorReady.value = true;
   } finally {
     resolveReady();
   }
@@ -389,12 +471,20 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div
-    ref="container"
-    class="rendered-editor h-full min-w-0 overflow-x-hidden overflow-y-auto px-8 py-7"
-    @click.capture="openLink"
-    @scroll.passive="keepHorizontalPosition"
-  />
+  <div class="relative h-full min-w-0">
+    <div
+      ref="container"
+      class="rendered-editor h-full min-w-0 overflow-x-hidden overflow-y-auto px-8 py-7 transition-opacity duration-150"
+      :class="editorReady ? 'opacity-100' : 'opacity-0'"
+      @click.capture="openLink"
+      @scroll.passive="keepHorizontalPosition"
+    />
+    <LoadingState
+      v-if="!editorReady"
+      class="absolute inset-0"
+      :label="locale === 'en' ? 'Preparing document…' : '正在排版文档…'"
+    />
+  </div>
 </template>
 
 <style>

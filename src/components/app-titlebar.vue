@@ -4,7 +4,8 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Minus, Square, X } from '@lucide/vue';
 
 const isMac = navigator.userAgent.includes('Macintosh');
-const nativeMacControls = isMac && isTauri();
+// Use clickable app controls in the undecorated macOS window.
+const nativeMacControls = false;
 defineProps<{ sidebarOpen: boolean; sidebarWidth: number; locale?: 'zh' | 'en' }>();
 
 async function runWindowAction(action: 'close' | 'minimize' | 'toggleMaximize') {
@@ -42,21 +43,24 @@ async function toggleWindowSize() {
           :title="locale === 'en' ? 'Close window' : '关闭窗口'"
           class="h-3 w-3 rounded-full bg-[#ff5f57]"
           type="button"
-          @click="runWindowAction('close')"
+          @mousedown.stop
+          @click.stop="runWindowAction('close')"
         />
         <button
           :aria-label="locale === 'en' ? 'Minimize window' : '最小化窗口'"
           :title="locale === 'en' ? 'Minimize window' : '最小化窗口'"
           class="h-3 w-3 rounded-full bg-[#febc2e]"
           type="button"
-          @click="runWindowAction('minimize')"
+          @mousedown.stop
+          @click.stop="runWindowAction('minimize')"
         />
         <button
           :aria-label="locale === 'en' ? 'Toggle fullscreen' : '切换全屏'"
           :title="locale === 'en' ? 'Toggle fullscreen' : '切换全屏'"
           class="h-3 w-3 rounded-full bg-[#28c840]"
           type="button"
-          @click="toggleWindowSize"
+          @mousedown.stop
+          @click.stop="toggleWindowSize"
         />
       </div>
       <slot name="sidebar-control" />

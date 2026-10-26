@@ -107,6 +107,10 @@ export function openProject(path: string): Promise<ProjectInfo> {
   return invoke<ProjectInfo>('open_project', { path });
 }
 
+export function revealProjectEntry(path: string | null): Promise<void> {
+  return invoke<void>('reveal_project_entry', { path });
+}
+
 export async function createProject(
   name: string,
   locale: 'zh' | 'en' = 'zh',
@@ -122,6 +126,10 @@ export async function createProject(
 
 export function listProjectTree(): Promise<TreeNode[]> {
   return invoke<TreeNode[]>('list_project_tree');
+}
+
+export function readDocumentRevision(path: string): Promise<string> {
+  return invoke<string>('read_document_revision', { path });
 }
 
 export function readDocument(path: string): Promise<Document> {

@@ -221,3 +221,20 @@ body:has(.theme-dark) .milkdown-toolbar {
   background: #263448;
   color: #e8eef7;
 }
+/* Keep the pane responsive while a new document replaces the previous editor. */
+.document-switch-enter-active,
+.document-switch-leave-active {
+  transition: opacity 140ms ease;
+}
+
+.document-switch-enter-from,
+.document-switch-leave-to {
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .document-switch-enter-active,
+  .document-switch-leave-active {
+    transition-duration: 0ms;
+  }
+}

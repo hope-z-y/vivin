@@ -10,6 +10,7 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { AnnotationMark } from '../lib/annotation-anchor';
 import type { AnnotationKind } from '../lib/project-api';
 import { equivalentMarkdown } from '../lib/markdown-roundtrip';
+import { renderMermaidPreview } from '../lib/mermaid-preview';
 import { importImage, readProjectImage } from '../lib/project-api';
 import '@milkdown/crepe/theme/common/style.css';
 import '@milkdown/crepe/theme/frame.css';
@@ -220,6 +221,18 @@ onMounted(async () => {
       defaultValue: props.modelValue,
       features: { [CrepeFeature.ImageBlock]: false },
       featureConfigs: {
+        [CrepeFeature.CodeMirror]: {
+          renderPreview: renderMermaidPreview,
+          previewOnlyByDefault: true,
+          previewToggleText: (previewOnlyMode) =>
+            previewOnlyMode
+              ? props.locale === 'en'
+                ? 'Edit code'
+                : '编辑代码'
+              : props.locale === 'en'
+                ? 'Show preview'
+                : '显示预览',
+        },
         [CrepeFeature.Placeholder]: {
           text: props.locale === 'en' ? 'Start writing…' : '开始写作…',
         },
@@ -395,6 +408,29 @@ onBeforeUnmount(() => {
 .rendered-editor .milkdown .ProseMirror {
   padding: 60px 8%;
   overflow-x: clip;
+}
+
+.rendered-editor .milkdown .milkdown-code-block .preview {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.rendered-editor .milkdown .milkdown-code-block .preview svg {
+  display: block;
+  margin: 0 auto;
+}
+
+.rendered-editor .milkdown .milkdown-code-block .preview:has(svg[id^='vivin-mermaid-']) {
+  padding: 12px;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.rendered-editor .milkdown .vivin-mermaid-error {
+  padding: 12px;
+  color: #b42318;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .rendered-editor .milkdown .milkdown-table-block {

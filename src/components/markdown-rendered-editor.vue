@@ -50,6 +50,10 @@ function openLink(event: MouseEvent) {
   emit('open-reference', link.getAttribute('href') ?? '');
 }
 
+function keepHorizontalPosition() {
+  if (container.value?.scrollLeft) container.value.scrollLeft = 0;
+}
+
 async function revealAnnotation(id: string): Promise<boolean> {
   await ready;
   const node = [
@@ -376,6 +380,7 @@ onBeforeUnmount(() => {
     ref="container"
     class="rendered-editor h-full min-w-0 overflow-x-hidden overflow-y-auto px-8 py-7"
     @click.capture="openLink"
+    @scroll.passive="keepHorizontalPosition"
   />
 </template>
 
@@ -389,6 +394,7 @@ onBeforeUnmount(() => {
 
 .rendered-editor .milkdown .ProseMirror {
   padding: 60px 8%;
+  overflow-x: clip;
 }
 
 .rendered-editor .milkdown .milkdown-table-block {

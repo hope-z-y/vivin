@@ -90,20 +90,37 @@ body,
 }
 
 .vivin-annotation-todo {
+  color: #9a6700;
   background: rgb(245 158 11 / 16%);
-  box-shadow: inset 0 -2px #d69e16;
 }
 .vivin-annotation-comment {
+  color: #2465b8;
   background: rgb(47 123 221 / 14%);
-  box-shadow: inset 0 -2px #2f7bdd;
 }
 .vivin-annotation-question {
+  color: #7b44ba;
   background: rgb(136 86 203 / 14%);
-  box-shadow: inset 0 -2px #8856cb;
 }
 .vivin-annotation-error {
+  color: #c73551;
   background: rgb(224 76 102 / 14%);
-  box-shadow: inset 0 -2px #e04c66;
+}
+
+.theme-dark .vivin-annotation-todo {
+  color: #f1bc59;
+  background: rgb(245 158 11 / 18%);
+}
+.theme-dark .vivin-annotation-comment {
+  color: #8ebcff;
+  background: rgb(47 123 221 / 20%);
+}
+.theme-dark .vivin-annotation-question {
+  color: #c9a4fb;
+  background: rgb(136 86 203 / 20%);
+}
+.theme-dark .vivin-annotation-error {
+  color: #ff8fa2;
+  background: rgb(224 76 102 / 20%);
 }
 
 .vivin-term {

@@ -1802,8 +1802,7 @@ onBeforeUnmount(() => {
                     ? { flex: `${index === 0 ? split : 100 - split} 1 0%` }
                     : {}
                 "
-                :class="windowExpanded ? 'rounded-none' : 'rounded-2xl'"
-                class="flex min-w-0 flex-1 flex-col overflow-hidden bg-white"
+                class="flex min-w-0 flex-1 flex-col overflow-hidden bg-white rounded-2xl"
                 @pointerdown="activePane = index"
                 @click.capture="handleEditorClick"
                 @mousemove="
@@ -2038,11 +2037,8 @@ onBeforeUnmount(() => {
           </div>
           <aside
             v-if="panel !== 'none' && project"
-            :class="[
-              readingPanel ? 'min-w-0 flex-1' : 'w-80 shrink-0',
-              windowExpanded ? 'rounded-none' : 'rounded-2xl',
-            ]"
-            class="flex flex-col overflow-hidden bg-white"
+            :class="[readingPanel ? 'min-w-0 flex-1 ml-2.5' : 'w-80 shrink-0 ml-2.5']"
+            class="flex flex-col overflow-hidden bg-white rounded-2xl"
           >
             <div
               :class="readingPanel ? 'h-11 px-6 font-medium' : 'h-12 px-4 font-semibold'"

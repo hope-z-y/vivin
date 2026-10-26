@@ -4,7 +4,8 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Minus, Square, X } from '@lucide/vue';
 
 const isMac = navigator.userAgent.includes('Macintosh');
-defineProps<{ sidebarOpen: boolean; locale?: 'zh' | 'en' }>();
+const nativeMacControls = isMac && isTauri();
+defineProps<{ sidebarOpen: boolean; sidebarWidth: number; locale?: 'zh' | 'en' }>();
 
 async function runWindowAction(action: 'close' | 'minimize' | 'toggleMaximize') {
   if (!isTauri()) return;
@@ -24,11 +25,18 @@ async function toggleWindowSize() {
     <div
       :class="[
         'flex h-full shrink-0 items-center px-4',
-        sidebarOpen ? 'w-64 justify-between' : 'w-28 justify-start gap-5',
+        nativeMacControls
+          ? sidebarOpen
+            ? 'w-64 justify-end'
+            : 'w-36 justify-end'
+          : sidebarOpen
+            ? 'w-64 justify-between'
+            : 'w-28 justify-start gap-5',
       ]"
+      :style="sidebarOpen ? { width: `${sidebarWidth}px` } : undefined"
       data-tauri-drag-region
     >
-      <div v-if="isMac" class="flex items-center gap-2">
+      <div v-if="isMac && !nativeMacControls" class="flex items-center gap-2">
         <button
           :aria-label="locale === 'en' ? 'Close window' : '关闭窗口'"
           :title="locale === 'en' ? 'Close window' : '关闭窗口'"

@@ -156,6 +156,13 @@ const panes = ref<Pane[]>([emptyPane()]);
 const activePane = ref(0);
 const expanded = ref(new Set<string>());
 const sidebar = ref(true);
+const maxSidebarWidth = ref(Math.max(200, Math.min(420, window.innerWidth - 480)));
+const savedSidebarWidth = readPreference<unknown>('vivin.sidebar-width', 256);
+const sidebarWidth = ref(
+  typeof savedSidebarWidth === 'number' && Number.isFinite(savedSidebarWidth)
+    ? clampSidebarWidth(savedSidebarWidth)
+    : 256,
+);
 const panel = ref<SidePanel>('none');
 const readingPanel = computed(() => panel.value === 'terms' || panel.value === 'history');
 const annotationFilter = ref<AnnotationKind>('todo');
@@ -216,6 +223,9 @@ function readPreference<T>(key: string, fallback: T): T {
     return fallback;
   }
 }
+function clampSidebarWidth(width: number): number {
+  return Math.round(Math.max(200, Math.min(420, window.innerWidth - 480, width)));
+}
 function translate(zh: string, en: string) {
   return locale.value === 'zh' ? zh : en;
 }
@@ -232,6 +242,7 @@ function kindLabel(kind: AnnotationKind) {
 }
 watch(locale, (value) => localStorage.setItem('vivin.locale', JSON.stringify(value)));
 watch(theme, (value) => localStorage.setItem('vivin.theme', JSON.stringify(value)));
+watch(sidebarWidth, (value) => localStorage.setItem('vivin.sidebar-width', JSON.stringify(value)));
 function rememberProject(next: ProjectInfo) {
   recentProjects.value = [
     next,
@@ -1194,6 +1205,33 @@ function resize(event: PointerEvent) {
   handle.addEventListener('pointercancel', stop);
   handle.addEventListener('lostpointercapture', stop);
 }
+function resizeSidebar(event: PointerEvent) {
+  const handle = event.currentTarget;
+  if (!(handle instanceof HTMLElement)) return;
+  const sidebarElement = handle.parentElement;
+  if (!sidebarElement) return;
+  handle.setPointerCapture(event.pointerId);
+  const move = (next: PointerEvent) => {
+    sidebarWidth.value = clampSidebarWidth(
+      next.clientX - sidebarElement.getBoundingClientRect().left,
+    );
+  };
+  const stop = () => {
+    handle.removeEventListener('pointermove', move);
+    handle.removeEventListener('pointerup', stop);
+    handle.removeEventListener('pointercancel', stop);
+    handle.removeEventListener('lostpointercapture', stop);
+    if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+  };
+  handle.addEventListener('pointermove', move);
+  handle.addEventListener('pointerup', stop);
+  handle.addEventListener('pointercancel', stop);
+  handle.addEventListener('lostpointercapture', stop);
+}
+function clampSidebarOnWindowResize() {
+  maxSidebarWidth.value = Math.max(200, Math.min(420, window.innerWidth - 480));
+  sidebarWidth.value = clampSidebarWidth(sidebarWidth.value);
+}
 function shortcut(event: KeyboardEvent) {
   if (event.key === 'Escape' && dialog.value) {
     finishDialog(false);
@@ -1217,6 +1255,7 @@ function shortcut(event: KeyboardEvent) {
 }
 onMounted(() => {
   window.addEventListener('keydown', shortcut);
+  window.addEventListener('resize', clampSidebarOnWindowResize);
   if (nativeAvailable()) {
     const currentWindow = getCurrentWindow();
     const syncWindowSize = async () => {
@@ -1331,6 +1370,7 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', shortcut);
+  window.removeEventListener('resize', clampSidebarOnWindowResize);
   if (saveTimer) clearTimeout(saveTimer);
   if (diskTimer) clearInterval(diskTimer);
   if (hideTermTimer) clearTimeout(hideTermTimer);
@@ -1355,7 +1395,7 @@ onBeforeUnmount(() => {
       more = false;
     "
   >
-    <AppTitlebar :sidebar-open="sidebar" :locale="locale">
+    <AppTitlebar :sidebar-open="sidebar" :sidebar-width="sidebarWidth" :locale="locale">
       <template #sidebar-control>
         <button
           class="rounded-md p-1.5 text-slate-600 hover:bg-slate-200/70"
@@ -1585,7 +1625,28 @@ onBeforeUnmount(() => {
       </div>
     </AppTitlebar>
     <div class="flex min-h-0 flex-1">
-      <aside v-if="sidebar" class="flex w-64 shrink-0 flex-col bg-[#f3f6fa]">
+      <aside
+        v-if="sidebar"
+        class="relative flex shrink-0 flex-col bg-[#f3f6fa]"
+        :style="{ width: `${sidebarWidth}px` }"
+      >
+        <div
+          class="group absolute inset-y-0 right-0 z-10 flex w-2 touch-none cursor-col-resize items-center justify-center"
+          role="separator"
+          aria-orientation="vertical"
+          :aria-label="translate('调整侧栏宽度', 'Resize sidebar')"
+          :aria-valuenow="sidebarWidth"
+          :aria-valuemin="200"
+          :aria-valuemax="maxSidebarWidth"
+          tabindex="0"
+          @pointerdown.prevent.stop="resizeSidebar"
+          @keydown.left.prevent="sidebarWidth = clampSidebarWidth(sidebarWidth - 16)"
+          @keydown.right.prevent="sidebarWidth = clampSidebarWidth(sidebarWidth + 16)"
+        >
+          <div
+            class="h-full w-px bg-slate-300 opacity-0 group-hover:opacity-100 group-focus:opacity-100"
+          />
+        </div>
         <div
           class="flex items-center justify-between px-4 pb-2 pt-4 text-xs font-semibold text-slate-500"
         >

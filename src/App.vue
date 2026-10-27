@@ -2105,7 +2105,7 @@ onBeforeUnmount(() => {
                               )
                         }}</span></span
                       >
-                      <div class="flex shrink-0 items-center gap-0.5 text-slate-500">
+                      <div class="flex shrink-0 items-center gap-1.5 text-slate-500">
                         <button
                           class="rounded-md p-1.5 hover:bg-slate-100"
                           :class="pane.outlineOpen ? 'bg-blue-50 text-blue-700' : ''"

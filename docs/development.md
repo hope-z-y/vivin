@@ -4,7 +4,7 @@
 
 仓库使用 Tauri 2、Vue 3、TypeScript、Vite、Tailwind CSS 4、Oxlint 和 Oxfmt，包管理器为 pnpm。`src/` 是 WebView 界面，`src-tauri/` 是原生进程。项目服务、编辑器与本机 MCP 接口已接入。
 
-参考 `iihua_vben` 的 2 空格、严格类型、职责拆分、最小范围验证和 Conventional Commits 做法；该项目的 monorepo、后台业务接口、权限体系和 ESLint/Prettier 配置不适用于 vivin。
+遵循仓库根目录的 `AGENTS.md`：2 空格、严格类型、职责拆分、最小范围验证和 Conventional Commits。不要引入不适用于单应用项目的 monorepo、后台业务接口或并行的 ESLint/Prettier 配置。
 
 ## 目录职责
 
@@ -18,7 +18,7 @@ src-tauri/src/
   metadata.rs      可复制的项目结构化数据
   history.rs       AI 修改记录与冲突安全的撤销
   ai.rs            带令牌的本机 MCP 服务
-docs/              产品需求、界面说明和开发决策
+docs/              开发说明
 ```
 
 目录按功能真正出现时再建立。Vue 组件只处理交互和展示；项目文件的边界、版本检查、锁定、原子写入与撤销记录应由原生侧统一保证。前端请求和 Rust 返回值要使用稳定、可序列化的类型，错误码与用户可见提示分开。

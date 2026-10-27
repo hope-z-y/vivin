@@ -4,7 +4,7 @@
 
 ## 依据和范围
 
-- 产品行为以 `docs/requirements.md` 为准；界面细节以 `docs/design/macos-ui-spec.md` 为准，概念图提供视觉方向。
+- 已实现功能和使用方式以 `README.md` 及代码为准；工程边界见 `docs/development.md`。新增行为应同步更新 README。
 - 这是单应用仓库，不照搬参考项目的 monorepo、后台 API、权限或发布流程。
 - 改动保持在满足当前任务所需的最小范围，保留用户未提交的改动。新增依赖时说明用途，并更新锁文件。
 

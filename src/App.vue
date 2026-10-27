@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import {
+  BookOpenText,
   Bookmark,
   ChevronDown,
   ChevronRight,
+  CodeXml,
   FilePlus2,
   FileText,
   Folder,
   Languages,
+  ListTree,
   LoaderCircle,
   LockKeyhole,
   Moon,
@@ -36,6 +39,7 @@ import {
 import AppTitlebar from './components/app-titlebar.vue';
 import EmptyPanel from './components/empty-panel.vue';
 import LoadingState from './components/loading-state.vue';
+import MarkdownOutlinePanel from './components/markdown-outline-panel.vue';
 import { annotationMarks, resolveAnnotation } from './lib/annotation-anchor';
 import { createTextMatcher } from './lib/text-matcher';
 import {
@@ -111,6 +115,7 @@ interface DocState extends Document {
 interface Pane {
   path: string | null;
   mode: Mode;
+  outlineOpen: boolean;
   filters: AnnotationKind[];
 }
 interface Row {
@@ -123,6 +128,7 @@ interface EditorHandle {
 }
 interface RenderedEditorHandle {
   revealAnnotation(id: string): Promise<boolean>;
+  revealHeading(offset: number): Promise<boolean>;
 }
 interface PendingJump {
   path: string;
@@ -153,6 +159,7 @@ const emptyData = (): ProjectData => ({
 const emptyPane = (): Pane => ({
   path: null,
   mode: 'rendered',
+  outlineOpen: false,
   filters: kinds.map((kind) => kind.value),
 });
 const project = ref<ProjectInfo | null>(null);
@@ -292,9 +299,13 @@ function confirmAction(title: string): Promise<boolean> {
 }
 const sourceEditors: (EditorHandle | null)[] = [];
 const renderedEditors: (RenderedEditorHandle | null)[] = [];
+const sourceEditorRefs: ((value: unknown) => void)[] = [];
+const renderedEditorRefs: ((value: unknown) => void)[] = [];
 const sourceRevealRequests = ref<(SourceRevealRequest | null)[]>([]);
 let revealToken = 0;
 let pendingJump: PendingJump | null = null;
+const pendingHeadingJumps = new Map<number, { path: string; offset: number }>();
+const headingJumpsInFlight = new Set<number>();
 const draftSequences = new Map<string, number>();
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 const draftTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -451,6 +462,7 @@ async function switchProject(create: boolean) {
 }
 function activateProject(next: ProjectInfo) {
   pendingJump = null;
+  pendingHeadingJumps.clear();
   selectedAnnotation.value = null;
   annotationEditing.value = false;
   sourceRevealRequests.value = [];
@@ -531,6 +543,7 @@ async function openDoc(path: string, paneIndex = activePane.value) {
   }
   const requestId = (paneRequestIds.get(paneIndex) ?? 0) + 1;
   paneRequestIds.set(paneIndex, requestId);
+  pendingHeadingJumps.delete(paneIndex);
   loadingPanes.value.add(paneIndex);
   try {
     if (!docs.value[path])
@@ -543,6 +556,7 @@ async function openDoc(path: string, paneIndex = activePane.value) {
     const pane = panes.value[paneIndex];
     if (!pane) return;
     pane.path = path;
+    pane.outlineOpen = false;
     if (lockSource(path) || path === 'AGENTS.md') pane.mode = 'source';
     else pane.mode = 'rendered';
     activePane.value = paneIndex;
@@ -618,12 +632,65 @@ async function revealPendingJump(index: number) {
   }
 }
 
+function toggleOutline(index: number) {
+  const pane = panes.value[index];
+  if (!pane?.path || !docs.value[pane.path]) return;
+  activePane.value = index;
+  pane.outlineOpen = !pane.outlineOpen;
+}
+
+async function jumpToHeading(index: number, offset: number) {
+  const pane = panes.value[index];
+  if (!pane?.path) return;
+  activePane.value = index;
+  pane.outlineOpen = false;
+  if (pane.mode === 'source' || lockSource(pane.path) || pane.path === 'AGENTS.md') {
+    sourceRevealRequests.value[index] = { offset, length: 0, token: ++revealToken };
+    return;
+  }
+  pendingHeadingJumps.set(index, { path: pane.path, offset });
+  await nextTick();
+  void revealPendingHeading(index);
+}
+
+async function revealPendingHeading(index: number) {
+  if (headingJumpsInFlight.has(index)) return;
+  const jump = pendingHeadingJumps.get(index);
+  if (!jump || panes.value[index]?.path !== jump.path) return;
+  const editor = renderedEditors[index];
+  if (!editor) return;
+  headingJumpsInFlight.add(index);
+  try {
+    const found = await editor.revealHeading(jump.offset);
+    if (pendingHeadingJumps.get(index) !== jump) return;
+    pendingHeadingJumps.delete(index);
+    if (!found)
+      message.value = translate(
+        '无法定位这个标题，请重试',
+        'Could not locate this heading. Try again.',
+      );
+  } finally {
+    headingJumpsInFlight.delete(index);
+    if (pendingHeadingJumps.has(index)) void revealPendingHeading(index);
+  }
+}
+
 function setSourceEditor(value: unknown, index: number) {
   sourceEditors[index] = value as EditorHandle | null;
 }
+function sourceEditorRef(index: number) {
+  return (sourceEditorRefs[index] ??= (value) => setSourceEditor(value, index));
+}
 function setRenderedEditor(value: unknown, index: number) {
+  if (renderedEditors[index] === value) return;
   renderedEditors[index] = value as RenderedEditorHandle | null;
-  if (value) void revealPendingJump(index);
+  if (value) {
+    void revealPendingJump(index);
+    void revealPendingHeading(index);
+  }
+}
+function renderedEditorRef(index: number) {
+  return (renderedEditorRefs[index] ??= (value) => setRenderedEditor(value, index));
 }
 function setContent(path: string, content: string) {
   const doc = docs.value[path];
@@ -1293,11 +1360,13 @@ async function removeAnnotation(annotation: Annotation) {
 function toggleSplit() {
   if (panes.value.length === 2) {
     panes.value.splice(1);
+    pendingHeadingJumps.delete(1);
     activePane.value = 0;
   } else
     panes.value.push({
       path: activePath.value,
       mode: 'source',
+      outlineOpen: false,
       filters: kinds.map((kind) => kind.value),
     });
 }
@@ -1369,6 +1438,7 @@ function shortcut(event: KeyboardEvent) {
     more.value = false;
     projectMenu.value = false;
     switcher.value = false;
+    for (const pane of panes.value) pane.outlineOpen = false;
   }
 }
 onMounted(() => {
@@ -1525,6 +1595,7 @@ onBeforeUnmount(() => {
       projectMenu = false;
       switcher = false;
       more = false;
+      panes.forEach((pane) => (pane.outlineOpen = false));
     "
   >
     <AppTitlebar :sidebar-open="sidebar" :sidebar-width="sidebarWidth" :locale="locale">
@@ -1652,22 +1723,6 @@ onBeforeUnmount(() => {
               @keydown.enter.prevent="runSearch"
             />
           </label>
-          <div class="mx-1 flex rounded-md bg-slate-200/70 p-0.5 text-xs">
-            <button
-              v-for="mode in ['source', 'rendered'] as const"
-              :key="mode"
-              :disabled="!!(activePath && lockSource(activePath)) || activePath === 'AGENTS.md'"
-              :class="[
-                panes[activePane]?.mode === mode
-                  ? 'bg-white text-slate-900 shadow-sm'
-                  : 'text-slate-500',
-                'rounded px-2 py-1 disabled:opacity-40',
-              ]"
-              @click.stop="panes[activePane]!.mode = mode"
-            >
-              {{ mode === 'source' ? translate('原文', 'Source') : translate('排版', 'Rendered') }}
-            </button>
-          </div>
           <button
             :title="translate('分栏', 'Split view')"
             class="rounded-md p-1.5 hover:bg-slate-200/70"
@@ -2022,30 +2077,80 @@ onBeforeUnmount(() => {
                     :key="`${pane.path}:${pane.mode}`"
                     class="flex min-h-0 flex-1 flex-col"
                   >
-                    <div class="flex h-11 shrink-0 items-center justify-between px-6 text-sm">
+                    <div class="relative flex h-11 shrink-0 items-center gap-2 px-6 text-sm">
                       <span
                         :class="[
-                          'truncate font-medium',
+                          'min-w-0 flex-1 truncate font-medium',
                           index === activePane && panes.length === 2 ? 'text-blue-700' : '',
                         ]"
-                        >{{ pane.path
+                        :title="pane.path"
+                      >
+                        {{ pane.path
                         }}<span
                           v-if="docs[pane.path]?.content !== docs[pane.path]?.savedContent"
                           class="ml-1 text-blue-500"
                           >•</span
-                        ></span
-                      ><span
+                        >
+                      </span>
+                      <span
                         v-if="lockSource(pane.path)"
-                        class="ml-2 flex shrink-0 items-center gap-1 text-xs text-amber-700"
-                        ><LockKeyhole :size="13" />{{
+                        class="flex shrink-0 items-center gap-1 text-xs text-amber-700"
+                        :title="lockSource(pane.path) ?? ''"
+                        ><LockKeyhole :size="13" /><span class="hidden xl:inline">{{
                           lockSource(pane.path) === pane.path
                             ? translate('已锁定', 'Locked')
                             : translate(
                                 `由 ${lockSource(pane.path)} 锁定`,
                                 `Locked by ${lockSource(pane.path)}`,
                               )
-                        }}</span
+                        }}</span></span
                       >
+                      <div class="flex shrink-0 items-center gap-0.5 text-slate-500">
+                        <button
+                          class="rounded-md p-1.5 hover:bg-slate-100"
+                          :class="pane.outlineOpen ? 'bg-blue-50 text-blue-700' : ''"
+                          :title="translate('文档目录', 'Document outline')"
+                          :aria-label="translate('文档目录', 'Document outline')"
+                          :aria-controls="`vivin-outline-${index}`"
+                          :aria-expanded="pane.outlineOpen"
+                          @click.stop="toggleOutline(index)"
+                        >
+                          <ListTree :size="17" />
+                        </button>
+                        <button
+                          v-for="mode in ['source', 'rendered'] as const"
+                          :key="mode"
+                          class="rounded-md p-1.5 hover:bg-slate-100 disabled:opacity-40"
+                          :class="pane.mode === mode ? 'bg-blue-50 text-blue-700' : ''"
+                          :disabled="!!lockSource(pane.path) || pane.path === 'AGENTS.md'"
+                          :title="
+                            mode === 'source'
+                              ? translate('原文', 'Source')
+                              : translate('排版', 'Rendered')
+                          "
+                          :aria-label="
+                            mode === 'source'
+                              ? translate('原文', 'Source')
+                              : translate('排版', 'Rendered')
+                          "
+                          :aria-pressed="pane.mode === mode"
+                          @click.stop="
+                            activePane = index;
+                            pane.mode = mode;
+                            pane.outlineOpen = false;
+                          "
+                        >
+                          <CodeXml v-if="mode === 'source'" :size="17" />
+                          <BookOpenText v-else :size="17" />
+                        </button>
+                      </div>
+                      <MarkdownOutlinePanel
+                        v-if="pane.outlineOpen"
+                        :panel-id="`vivin-outline-${index}`"
+                        :markdown="docs[pane.path]?.content ?? ''"
+                        :locale="locale"
+                        @select="jumpToHeading(index, $event)"
+                      />
                     </div>
                     <div
                       v-if="docs[pane.path]?.conflict"
@@ -2080,7 +2185,7 @@ onBeforeUnmount(() => {
                           pane.path === 'AGENTS.md'
                         "
                         :key="`${index}:${pane.path}:source`"
-                        :ref="(value) => setSourceEditor(value, index)"
+                        :ref="sourceEditorRef(index)"
                         :model-value="docs[pane.path]?.content ?? ''"
                         :document-path="pane.path"
                         :reveal-request="sourceRevealRequests[index] ?? undefined"
@@ -2104,7 +2209,7 @@ onBeforeUnmount(() => {
                             : MarkdownRenderedEditor
                         "
                         :key="`${index}:${pane.path}:rendered:${locale}:${(docs[pane.path]?.content.length ?? 0) >= virtualDocumentThreshold ? 'virtual' : 'single'}`"
-                        :ref="(value) => setRenderedEditor(value, index)"
+                        :ref="renderedEditorRef(index)"
                         :model-value="docs[pane.path]?.content ?? ''"
                         :document-path="pane.path"
                         :annotations="annotationMarksByDocument[pane.path]"

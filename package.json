@@ -12,6 +12,7 @@
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "test:segments": "node --experimental-strip-types --test tests/markdown-segments.test.mjs",
+    "test:outline": "node --experimental-strip-types --test tests/markdown-outline.test.mjs",
     "check": "pnpm typecheck && pnpm lint && pnpm format:check",
     "tauri": "tauri"
   },

@@ -26,16 +26,22 @@ const emit = defineEmits<{
   'open-reference': [href: string];
 }>();
 
-type EditorHandle = { revealAnnotation: (id: string) => Promise<boolean> };
+type EditorHandle = {
+  revealAnnotation: (id: string) => Promise<boolean>;
+  revealHeading: (offset: number) => Promise<boolean>;
+};
 const segments = shallowRef<MarkdownSegment[]>(splitMarkdown(props.modelValue));
 const scrollHost = ref<HTMLDivElement>();
 const mounted = shallowRef(new Set([0, 1]));
 const measured = shallowRef<Record<number, number>>({});
 const shells: (HTMLDivElement | null)[] = [];
 const editors: (EditorHandle | null)[] = [];
+const shellRefs: ((value: unknown) => void)[] = [];
+const editorRefs: ((value: unknown) => void)[] = [];
 const ready = shallowRef(new Set<number>());
 const visible = new Set<number>();
 const recentlyEdited: number[] = [];
+let headingJumpTarget: number | null = null;
 let intersectionObserver: IntersectionObserver | undefined;
 let resizeObserver: ResizeObserver | undefined;
 let lastEmitted: string | undefined;
@@ -83,6 +89,10 @@ function setShell(value: unknown, index: number) {
   }
 }
 
+function shellRef(index: number) {
+  return (shellRefs[index] ??= (value) => setShell(value, index));
+}
+
 function setEditor(value: unknown, index: number) {
   editors[index] = value as EditorHandle | null;
   if (!value && ready.value.has(index)) {
@@ -92,9 +102,14 @@ function setEditor(value: unknown, index: number) {
   }
 }
 
+function editorRef(index: number) {
+  return (editorRefs[index] ??= (value) => setEditor(value, index));
+}
+
 function updateMounted() {
   if (!visible.size) return;
   const next = new Set<number>(recentlyEdited);
+  if (headingJumpTarget !== null) next.add(headingJumpTarget);
   for (const index of visible)
     for (
       let nearby = Math.max(0, index - 1);
@@ -202,7 +217,27 @@ async function revealAnnotation(id: string): Promise<boolean> {
   return (await editors[index]?.revealAnnotation(id)) ?? false;
 }
 
-defineExpose({ revealAnnotation });
+async function revealHeading(offset: number): Promise<boolean> {
+  const index = currentRanges.value.findIndex(
+    (range) => offset >= range.start && offset < range.end,
+  );
+  if (index < 0) return false;
+  headingJumpTarget = index;
+  mounted.value = new Set([...mounted.value, index]);
+  try {
+    await nextTick();
+    shells[index]?.scrollIntoView({ block: 'center', inline: 'nearest' });
+    await nextTick();
+    const start = currentRanges.value[index]?.start;
+    if (start === undefined) return false;
+    return (await editors[index]?.revealHeading(offset - start)) ?? false;
+  } finally {
+    headingJumpTarget = null;
+    updateMounted();
+  }
+}
+
+defineExpose({ revealAnnotation, revealHeading });
 </script>
 
 <template>
@@ -210,7 +245,7 @@ defineExpose({ revealAnnotation });
     <div
       v-for="(segment, index) in segments"
       :key="segment.id"
-      :ref="(value) => setShell(value, index)"
+      :ref="shellRef(index)"
       :data-segment-index="index"
       :data-segment-start="currentRanges[index]?.start"
       :data-segment-end="currentRanges[index]?.end"
@@ -223,7 +258,7 @@ defineExpose({ revealAnnotation });
     >
       <MarkdownRenderedEditor
         v-if="mounted.has(index)"
-        :ref="(value) => setEditor(value, index)"
+        :ref="editorRef(index)"
         :model-value="segment.content"
         :document-path="documentPath"
         :readonly="readonly"

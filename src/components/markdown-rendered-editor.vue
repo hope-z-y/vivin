@@ -8,6 +8,7 @@ import { Decoration, DecorationSet } from '@milkdown/kit/prose/view';
 import { $prose, replaceAll } from '@milkdown/kit/utils';
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { AnnotationMark } from '../lib/annotation-anchor';
+import { markdownHeadings } from '../lib/markdown-outline';
 import type { AnnotationKind } from '../lib/project-api';
 import { equivalentMarkdown } from '../lib/markdown-roundtrip';
 import { createTextMatcher } from '../lib/text-matcher';
@@ -121,7 +122,21 @@ async function revealAnnotation(id: string): Promise<boolean> {
   return true;
 }
 
-defineExpose({ revealAnnotation });
+async function revealHeading(offset: number): Promise<boolean> {
+  await ready;
+  const index = markdownHeadings(props.modelValue).findIndex(
+    (heading) => heading.offset === offset,
+  );
+  if (index < 0) return false;
+  const node = container.value?.querySelectorAll<HTMLElement>(
+    '.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror h5, .ProseMirror h6',
+  )[index];
+  if (!node) return false;
+  node.scrollIntoView({ block: 'center', inline: 'nearest' });
+  return true;
+}
+
+defineExpose({ revealAnnotation, revealHeading });
 
 async function proxyImage(url: string): Promise<string> {
   if (/^(https?:|data:|blob:)/i.test(url)) return url;

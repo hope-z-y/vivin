@@ -67,22 +67,6 @@ export interface ProjectData {
   annotations: Annotation[];
 }
 
-export interface HistoryEntry {
-  id: string;
-  time: number;
-  operation: string;
-  target: string;
-  beforeContent: string | null;
-  afterContent: string | null;
-  beforeData: ProjectData | null;
-  afterData: ProjectData | null;
-}
-
-export interface BridgeInfo {
-  url: string;
-  configPath: string;
-}
-
 export interface Document {
   path: string;
   content: string;
@@ -250,29 +234,6 @@ export function readProjectImage(document: string, source: string): Promise<stri
   return invoke<string>('read_project_image', { document, source });
 }
 
-export function readProjectRules(): Promise<Document> {
-  return invoke<Document>('read_project_rules');
-}
-
-export function saveProjectRules(document: Document): Promise<Document> {
-  return invoke<Document>('save_project_rules', {
-    content: document.content,
-    expectedRevision: document.revision,
-  });
-}
-
-export function listHistory(): Promise<HistoryEntry[]> {
-  return invoke<HistoryEntry[]>('list_history');
-}
-
-export function undoChange(id: string): Promise<HistoryEntry> {
-  return invoke<HistoryEntry>('undo_change', { id });
-}
-
-export function bridgeInfo(): Promise<BridgeInfo> {
-  return invoke<BridgeInfo>('bridge_info');
-}
-
 export function setDirtyDraft(dirty: boolean): Promise<void> {
   return invoke<void>('set_dirty_draft', { dirty });
 }
@@ -288,4 +249,16 @@ export function publishDraft(
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export function getPlatform(): Promise<'macos' | 'windows' | 'linux'> {
+  return invoke<unknown>('get_platform').then((value) => {
+    if (value !== 'macos' && value !== 'windows' && value !== 'linux')
+      throw new Error('无法识别当前操作系统');
+    return value;
+  });
+}
+
+export function reloadDocument(path: string): Promise<Document> {
+  return invoke('reload_document', { path });
 }

@@ -6,8 +6,6 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::sync::Mutex;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
@@ -118,8 +116,7 @@ pub fn open_project_reference(
     let is_project_document = canonical
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-        && !relative.starts_with("resources/")
-        && relative != "AGENTS.md";
+        && !relative.starts_with("resources/");
     if is_project_document {
         checked_document(&root, &relative)?;
         Ok(OpenReferenceResult {
@@ -168,23 +165,9 @@ pub fn reveal_project_entry(
         Some(path) => checked_member(&root, &path)?,
         None => root,
     };
-    #[cfg(target_os = "macos")]
-    {
-        let status = Command::new("open")
-            .arg("-R")
-            .arg(&target)
-            .status()
-            .map_err(|error| error.to_string())?;
-        if !status.success() {
-            return Err("Finder 无法显示该项目文件".to_string());
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
     app.opener()
-        .open_path(target.to_string_lossy(), None::<&str>)
+        .reveal_item_in_dir(target)
         .map_err(|error| error.to_string())?;
-    #[cfg(target_os = "macos")]
-    let _ = app;
     Ok(())
 }
 
@@ -217,23 +200,6 @@ impl ProjectSession {
             .lock()
             .map_err(|_| "编辑状态不可用".to_string())? = false;
         *self.root.lock().map_err(|_| "项目状态不可用".to_string())? = Some(root);
-        Ok(())
-    }
-
-    pub(crate) fn clear_root(&self) -> Result<(), String> {
-        self.draft_sequences
-            .lock()
-            .map_err(|_| "草稿状态不可用".to_string())?
-            .clear();
-        self.drafts
-            .lock()
-            .map_err(|_| "草稿状态不可用".to_string())?
-            .clear();
-        *self
-            .dirty
-            .lock()
-            .map_err(|_| "编辑状态不可用".to_string())? = false;
-        *self.root.lock().map_err(|_| "项目状态不可用".to_string())? = None;
         Ok(())
     }
 
@@ -466,21 +432,6 @@ pub(crate) fn checked_document(root: &Path, relative: &str) -> Result<PathBuf, S
     Ok(absolute)
 }
 
-pub(crate) fn checked_rules(root: &Path) -> Result<PathBuf, String> {
-    if fs::symlink_metadata(root.join("AGENTS.md"))
-        .map_err(|error| error.to_string())?
-        .file_type()
-        .is_symlink()
-    {
-        return Err("项目规则文件不能是符号链接".to_string());
-    }
-    let path = fs::canonicalize(root.join("AGENTS.md")).map_err(|error| error.to_string())?;
-    if !path.starts_with(root) || !path.is_file() {
-        return Err("项目规则文件不在当前项目内".to_string());
-    }
-    Ok(path)
-}
-
 pub(crate) fn collect_tree(
     root: &Path,
     directory: &Path,
@@ -501,8 +452,7 @@ pub(crate) fn collect_tree(
 
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.')
-            || (directory == root
-                && (name == "resources" || name == "attachments" || name == "AGENTS.md"))
+            || (directory == root && (name == "resources" || name == "attachments"))
         {
             continue;
         }
@@ -566,16 +516,6 @@ pub fn open_project(path: String, state: State<'_, ProjectSession>) -> Result<Pr
         path: root.to_string_lossy().into_owned(),
     };
     ProjectData::load(&root)?;
-    let rules = root.join("AGENTS.md");
-    if !rules.exists() {
-        fs::write(&rules, "# 项目写作规则\n\n").map_err(|error| error.to_string())?;
-    }
-    if !fs::canonicalize(&rules)
-        .map_err(|error| error.to_string())?
-        .starts_with(&root)
-    {
-        return Err("项目规则文件不能指向项目外部".to_string());
-    }
     state.set_root(root)?;
     Ok(info)
 }
@@ -600,8 +540,6 @@ pub fn create_project(
     fs::create_dir(&root).map_err(|error| error.to_string())?;
     let result = (|| {
         fs::create_dir(root.join("resources")).map_err(|error| error.to_string())?;
-        fs::write(root.join("AGENTS.md"), "# 项目写作规则\n\n")
-            .map_err(|error| error.to_string())?;
         Ok::<(), String>(())
     })();
     if let Err(error) = result {
@@ -642,11 +580,7 @@ pub fn read_document_revision(
     state: State<'_, ProjectSession>,
 ) -> Result<String, String> {
     let root = state.root()?;
-    let absolute = if path == "AGENTS.md" {
-        checked_rules(&root)?
-    } else {
-        checked_document(&root, &path)?
-    };
+    let absolute = checked_document(&root, &path)?;
     let content = fs::read_to_string(absolute).map_err(|error| error.to_string())?;
     Ok(revision(&content))
 }
@@ -1349,52 +1283,73 @@ pub fn read_project_image(
 }
 
 #[tauri::command]
-pub fn read_project_rules(state: State<'_, ProjectSession>) -> Result<Document, String> {
-    let root = state.root()?;
-    let content = fs::read_to_string(checked_rules(&root)?).map_err(|error| error.to_string())?;
-    Ok(Document {
-        path: "AGENTS.md".to_string(),
-        revision: revision(&content),
-        content,
-    })
+pub fn get_platform() -> &'static str {
+    std::env::consts::OS
+}
+
+impl ProjectSession {
+    fn reload_document(&self, path: String) -> Result<Document, String> {
+        let _guard = self.mutation_guard()?;
+        let root = self.root()?;
+        let file = checked_document(&root, &path)?;
+        let content = fs::read_to_string(file).map_err(|error| error.to_string())?;
+        self.remove_draft(&path)?;
+        Ok(Document {
+            path,
+            revision: revision(&content),
+            content,
+        })
+    }
 }
 
 #[tauri::command]
-pub fn save_project_rules(
-    content: String,
-    expected_revision: String,
-    state: State<'_, ProjectSession>,
-) -> Result<Document, String> {
-    let root = state.root()?;
-    let _guard = state
-        .mutation
-        .lock()
-        .map_err(|_| "项目写入状态不可用".to_string())?;
-    let path = checked_rules(&root)?;
-    let current = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    if revision(&current) != expected_revision {
-        return Err("项目规则已被其他程序修改，请先重新加载".to_string());
-    }
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(&root).map_err(|error| error.to_string())?;
-    temporary
-        .write_all(content.as_bytes())
-        .map_err(|error| error.to_string())?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| error.to_string())?;
-    temporary.persist(path).map_err(|error| error.to_string())?;
-    Ok(Document {
-        path: "AGENTS.md".to_string(),
-        revision: revision(&content),
-        content,
-    })
+pub fn reload_document(path: String, state: State<'_, ProjectSession>) -> Result<Document, String> {
+    state.reload_document(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_reload_discards_stale_draft_and_rejects_stale_autosave() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let session = ProjectSession::default();
+        session.set_root(root.clone()).unwrap();
+        fs::write(root.join("note.md"), "original").unwrap();
+        let old_revision = revision("original");
+        session.drafts.lock().unwrap().insert(
+            "note.md".to_string(),
+            Draft {
+                content: "unsaved draft".to_string(),
+                base_revision: old_revision.clone(),
+            },
+        );
+        fs::write(root.join("note.md"), "changed on disk").unwrap();
+        assert!(
+            save_document_unlocked(
+                &root,
+                "note.md".to_string(),
+                "stale autosave".to_string(),
+                old_revision
+            )
+            .is_err()
+        );
+        let loaded = session.reload_document("note.md".to_string()).unwrap();
+        assert_eq!(loaded.content, "changed on disk");
+        assert_eq!(loaded.revision, revision("changed on disk"));
+        assert!(session.draft("note.md").unwrap().is_none());
+        assert_eq!(
+            fs::read_to_string(root.join("note.md")).unwrap(),
+            "changed on disk"
+        );
+        assert!(
+            session
+                .reload_document("../outside.md".to_string())
+                .is_err()
+        );
+    }
 
     #[test]
     fn rejects_paths_outside_the_project() {

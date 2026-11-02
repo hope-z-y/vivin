@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>vivin editor regression fixture</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div
+      id="fixture"
+      style="
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        z-index: 200;
+        background: #fff;
+        color: #111;
+        font: 12px monospace;
+        padding: 4px;
+        max-width: 100vw;
+      "
+    >
+      <button id="capture">记录编辑器位置</button>
+      <button id="verify">检查编辑器保留</button>
+      <button id="disk">模拟磁盘变化</button>
+      <button id="saved">检查保存内容</button>
+      <button id="size">检查批注尺寸</button>
+      <output id="result">就绪</output>
+    </div>
+    <script type="module" src="./editor.mjs"></script>
+  </body>
+</html>

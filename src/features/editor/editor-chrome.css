@@ -1,0 +1,212 @@
+.app-shell {
+  --document-background: #fff;
+  --document-text: #334155;
+  --document-heading: #17263c;
+  --document-muted: #718096;
+  --document-border: #e5ebf3;
+  --document-soft: #f5f7fb;
+  --document-accent: #376fbc;
+  --document-font:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+.app-shell.theme-dark {
+  --document-background: #1b2635;
+  --document-text: #cbd7e6;
+  --document-heading: #edf3fc;
+  --document-muted: #9aaec6;
+  --document-border: #35465b;
+  --document-soft: #243245;
+  --document-accent: #95bfff;
+}
+
+.document-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  min-height: 60px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--document-border);
+}
+
+.view-switch {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--document-soft);
+  border-radius: 9px;
+}
+.view-switch-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.view-switch-button:hover {
+  color: var(--document-accent);
+}
+.view-switch-button.is-active {
+  background: var(--document-background);
+  color: var(--document-accent);
+  box-shadow: 0 1px 4px #102f5012;
+  font-weight: 600;
+}
+.format-button {
+  padding: 7px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.format-button:hover {
+  background: var(--document-soft);
+  color: var(--document-accent);
+}
+.format-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.auto-format-control {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.auto-format-control input {
+  accent-color: var(--document-accent);
+}
+.mermaid-figure {
+  margin: 1.4em 0;
+  overflow: hidden;
+  border: 1px solid var(--document-border);
+  border-radius: 12px;
+  background: var(--document-background);
+}
+.diagram-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--document-border);
+  color: var(--document-muted);
+  font: 13px/1.4 var(--document-font);
+}
+.diagram-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 0;
+  border-radius: 6px;
+  padding: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.diagram-toolbar button:hover {
+  background: var(--document-soft);
+  color: var(--document-accent);
+}
+.diagram-toolbar button:disabled {
+  opacity: 0.35;
+}
+.diagram-svg {
+  padding: 24px 16px;
+  overflow-x: auto;
+}
+.diagram-svg svg {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+  height: auto;
+}
+.diagram-loading,
+.diagram-error {
+  padding: 24px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--document-muted);
+}
+.diagram-error {
+  color: #d46464;
+  white-space: pre-wrap;
+}
+.diagram-dialog {
+  width: min(1200px, 94vw);
+  max-width: 94vw;
+  height: min(850px, 90vh);
+  max-height: 90vh;
+  padding: 0;
+  margin: auto;
+  border: 1px solid var(--document-border);
+  border-radius: 16px;
+  background: var(--document-background);
+  color: var(--document-text);
+  box-shadow: 0 24px 100px #0004;
+}
+.diagram-dialog::backdrop {
+  background: #0d1a2b99;
+  backdrop-filter: blur(5px);
+}
+.diagram-dialog-body {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.diagram-viewport {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 32px;
+}
+.diagram-zoom {
+  display: flex;
+  align-items: center;
+  margin: 0 auto;
+  min-height: 100%;
+}
+.diagram-zoom img {
+  display: block;
+  width: 100%;
+  max-width: none !important;
+  height: auto;
+}
+.diagram-toolbar button:focus-visible,
+.view-switch-button:focus-visible,
+.format-button:focus-visible {
+  outline: 2px solid var(--document-accent);
+  outline-offset: 2px;
+}
+
+.theme-dark .outline-heading {
+  color: var(--document-text);
+}
+
+@media (max-width: 1000px) {
+  .document-toolbar {
+    padding-inline: 14px;
+  }
+  .document-actions {
+    flex-wrap: wrap;
+  }
+  .auto-format-control span {
+    display: none;
+  }
+}
+
+/* Adapt the document viewport to narrow panes without changing theme typography. */
+.markdown-canvas {
+  container-type: inline-size;
+}
+@container (max-width: 640px) {
+  .rendered-editor .milkdown .ProseMirror {
+    padding-inline: 20px;
+  }
+}

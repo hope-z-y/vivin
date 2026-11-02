@@ -1,5 +1,4 @@
 mod ai;
-mod history;
 mod metadata;
 mod project;
 
@@ -19,6 +18,8 @@ pub fn run() {
             project::list_project_tree,
             project::read_document,
             project::read_document_revision,
+            project::reload_document,
+            project::get_platform,
             project::save_document,
             project::create_document,
             project::create_directory,
@@ -40,13 +41,8 @@ pub fn run() {
             project::import_resource,
             project::import_image,
             project::read_project_image,
-            project::read_project_rules,
-            project::save_project_rules,
             project::set_dirty_draft,
             project::publish_draft,
-            ai::bridge_info,
-            ai::list_history,
-            ai::undo_change,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

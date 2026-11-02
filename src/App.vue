@@ -5,7 +5,6 @@ import {
   ChevronDown,
   ChevronRight,
   CodeXml,
-  Eye,
   FilePlus2,
   FileText,
   Folder,
@@ -16,6 +15,7 @@ import {
   Moon,
   MoreHorizontal,
   PanelLeft,
+  Palette,
   PanelsTopLeft,
   Pencil,
   Plus,
@@ -46,8 +46,8 @@ import MarkdownOutlinePanel from './components/markdown-outline-panel.vue';
 import { annotationMarks, resolveAnnotation } from './lib/annotation-anchor';
 import { createTextMatcher } from './lib/text-matcher';
 import { formatDocument } from './lib/format-document';
+import { documentThemes, type DocumentTheme } from './lib/editor-theme';
 import {
-  bridgeInfo,
   chooseProject,
   createDirectory,
   createDocument,
@@ -57,7 +57,6 @@ import {
   deleteTerm,
   errorMessage,
   getProjectData,
-  listHistory,
   listProjectTree,
   listResources,
   moveEntry,
@@ -68,22 +67,20 @@ import {
   publishDraft,
   readDocument,
   readDocumentRevision,
-  readProjectRules,
+  reloadDocument,
   revealProjectEntry,
+  getPlatform,
   saveDocument,
-  saveProjectRules,
   searchDocuments,
   setDirtyDraft,
   setLocked,
   setPinned,
   setTermException,
-  undoChange,
   upsertAnnotation,
   upsertTerm,
   type Annotation,
   type AnnotationKind,
   type Document,
-  type HistoryEntry,
   type ProjectData,
   type ProjectInfo,
   type ResourceNode,
@@ -97,31 +94,24 @@ const MarkdownRenderedEditor = defineAsyncComponent({
   loadingComponent: LoadingState,
   delay: 0,
 });
-const MarkdownVirtualEditor = defineAsyncComponent({
-  loader: () => import('./components/markdown-virtual-editor.vue'),
-  loadingComponent: LoadingState,
-  delay: 0,
-});
 const MarkdownSourceEditor = defineAsyncComponent({
   loader: () => import('./components/markdown-source-editor.vue'),
   loadingComponent: LoadingState,
   delay: 0,
 });
-const MarkdownPreview = defineAsyncComponent({
-  loader: () => import('./components/markdown-preview.vue'),
-  loadingComponent: LoadingState,
-  delay: 0,
-});
+const AnnotationMarkdown = defineAsyncComponent(
+  () => import('./components/annotation-markdown.vue'),
+);
 
-type Mode = 'source' | 'rendered' | 'preview';
-const virtualDocumentThreshold = 80_000;
-type SidePanel = 'none' | 'search' | 'terms' | 'annotations' | 'history';
+type Mode = 'source' | 'rendered';
+type SidePanel = 'none' | 'search' | 'terms' | 'annotations';
 interface DocState extends Document {
   savedContent: string;
   conflict: boolean;
   saving: boolean;
 }
 interface Pane {
+  id: number;
   path: string | null;
   mode: Mode;
   outlineOpen: boolean;
@@ -136,6 +126,7 @@ interface EditorHandle {
   selectedText(): { quote: string; offset: number } | null;
 }
 interface RenderedEditorHandle {
+  flush(): void;
   revealAnnotation(id: string): Promise<boolean>;
   revealHeading(offset: number): Promise<boolean>;
 }
@@ -165,7 +156,9 @@ const emptyData = (): ProjectData => ({
   termExceptions: [],
   annotations: [],
 });
+let nextPaneId = 0;
 const emptyPane = (): Pane => ({
+  id: nextPaneId++,
   path: null,
   mode: 'rendered',
   outlineOpen: false,
@@ -197,13 +190,14 @@ const sidebarWidth = ref(
     : 256,
 );
 const panel = ref<SidePanel>('none');
-const readingPanel = computed(() => panel.value === 'terms' || panel.value === 'history');
+const readingPanel = computed(() => panel.value === 'terms');
 const annotationFilter = ref<AnnotationKind>('todo');
 const query = ref('');
 const hits = ref<SearchHit[]>([]);
-const history = ref<HistoryEntry[]>([]);
 const selectedAnnotation = ref<Annotation | null>(null);
 const annotationPopoverAt = ref({ x: 0, y: 0 });
+const annotationPopoverSize = ref({ width: 320, height: 240 });
+let annotationResizeObserver: ResizeObserver | undefined;
 const annotationEditing = ref(false);
 const annotationDraft = ref('');
 const annotationSaving = ref(false);
@@ -227,13 +221,26 @@ const context = ref<TreeNode | null>(null);
 const contextAt = ref({ x: 0, y: 0 });
 const more = ref(false);
 const projectMenu = ref(false);
-const switcher = ref(false);
-const recentProjects = ref<ProjectInfo[]>(readPreference('vivin.recent-projects', []));
 const locale = ref<'zh' | 'en'>(
   readPreference<string>('vivin.locale', 'zh') === 'en' ? 'en' : 'zh',
 );
 const theme = ref<'light' | 'dark'>(
   readPreference<string>('vivin.theme', 'light') === 'dark' ? 'dark' : 'light',
+);
+const platform = ref<'macos' | 'windows' | 'linux'>('macos');
+const revealLabel = computed(() =>
+  platform.value === 'macos'
+    ? translate('在 Finder 中显示', 'Show in Finder')
+    : platform.value === 'windows'
+      ? translate('在文件资源管理器中显示', 'Show in File Explorer')
+      : translate('在文件管理器中显示', 'Show in file manager'),
+);
+const savedDocumentTheme = readPreference<unknown>('vivin.document-theme', 'frame');
+const documentTheme = ref<DocumentTheme>(
+  savedDocumentTheme === 'classic' || savedDocumentTheme === 'nord' ? savedDocumentTheme : 'frame',
+);
+watch(documentTheme, (value) =>
+  localStorage.setItem('vivin.document-theme', JSON.stringify(value)),
 );
 const windowExpanded = ref(false);
 const split = ref(50);
@@ -246,8 +253,6 @@ let refreshGeneration = 0;
 const searching = ref(false);
 const searchRan = ref(false);
 let searchRequest = 0;
-const historyLoading = ref(false);
-let historyRequest = 0;
 const message = ref('');
 function readPreference<T>(key: string, fallback: T): T {
   try {
@@ -277,14 +282,6 @@ watch(locale, (value) => localStorage.setItem('vivin.locale', JSON.stringify(val
 watch(theme, (value) => localStorage.setItem('vivin.theme', JSON.stringify(value)));
 watch(autoFormat, (value) => localStorage.setItem('vivin.auto-format', JSON.stringify(value)));
 watch(sidebarWidth, (value) => localStorage.setItem('vivin.sidebar-width', JSON.stringify(value)));
-function rememberProject(next: ProjectInfo) {
-  recentProjects.value = [
-    next,
-    ...recentProjects.value.filter((item) => item.path !== next.path),
-  ].slice(0, 8);
-  localStorage.setItem('vivin.recent-projects', JSON.stringify(recentProjects.value));
-  localStorage.setItem('vivin.last-project', JSON.stringify(next.path));
-}
 const dialog = ref<{
   kind: 'text' | 'confirm';
   title: string;
@@ -313,10 +310,10 @@ function confirmAction(title: string): Promise<boolean> {
     dialogResolve = resolve as (value: string | boolean | null) => void;
   });
 }
-const sourceEditors: (EditorHandle | null)[] = [];
-const renderedEditors: (RenderedEditorHandle | null)[] = [];
-const sourceEditorRefs: ((value: unknown) => void)[] = [];
-const renderedEditorRefs: ((value: unknown) => void)[] = [];
+const sourceEditors = new Map<number, EditorHandle | null>();
+const renderedEditors = new Map<number, RenderedEditorHandle | null>();
+const sourceEditorRefs = new Map<number, (value: unknown) => void>();
+const renderedEditorRefs = new Map<number, (value: unknown) => void>();
 const sourceRevealRequests = ref<(SourceRevealRequest | null)[]>([]);
 let revealToken = 0;
 let pendingJump: PendingJump | null = null;
@@ -440,9 +437,9 @@ function clearMarkTimers() {
 }
 
 async function switchProject(create: boolean) {
+  flushEditors();
   if (busy.value) return;
   projectMenu.value = false;
-  switcher.value = false;
   if (!nativeAvailable()) {
     message.value = translate(
       '请在桌面窗口中使用项目功能',
@@ -484,7 +481,7 @@ function activateProject(next: ProjectInfo) {
   annotationEditing.value = false;
   sourceRevealRequests.value = [];
   project.value = next;
-  rememberProject(next);
+  localStorage.setItem('vivin.last-project', JSON.stringify(next.path));
   tree.value = [];
   resources.value = [];
   data.value = emptyData();
@@ -504,34 +501,9 @@ function activateProject(next: ProjectInfo) {
   searchRan.value = false;
   searchRequest++;
   searching.value = false;
-  historyRequest++;
-  historyLoading.value = false;
-  history.value = [];
-}
-async function switchRecent(path: string) {
-  if (busy.value) return;
-  switcher.value = false;
-  if (project.value?.path === path) return;
-  if (
-    dirty.value &&
-    !(await confirmAction(
-      translate('有未保存的内容，确定切换项目吗？', 'You have unsaved changes. Switch projects?'),
-    ))
-  )
-    return;
-  busy.value = true;
-  try {
-    activateProject(await openProject(path));
-    await refresh();
-    message.value = '';
-  } catch (error) {
-    report(error);
-  } finally {
-    busy.value = false;
-  }
 }
 async function restoreLastProject() {
-  const path = readPreference<string>('vivin.last-project', recentProjects.value[0]?.path ?? '');
+  const path = readPreference<string>('vivin.last-project', '');
   if (!path || project.value) return;
   busy.value = true;
   try {
@@ -549,6 +521,7 @@ async function restoreLastProject() {
   }
 }
 async function openDoc(path: string, paneIndex = activePane.value) {
+  flushEditors();
   if (
     panes.value[paneIndex]?.path === path &&
     docs.value[path] &&
@@ -563,8 +536,12 @@ async function openDoc(path: string, paneIndex = activePane.value) {
   pendingHeadingJumps.delete(paneIndex);
   loadingPanes.value.add(paneIndex);
   try {
-    if (!docs.value[path])
-      remember(path === 'AGENTS.md' ? await readProjectRules() : await readDocument(path));
+    if (!docs.value[path]) {
+      const currentProject = project.value;
+      const loaded = await readDocument(path);
+      if (project.value !== currentProject) return;
+      remember(loaded);
+    }
     await nextTick();
     await new Promise<void>((resolve) =>
       requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
@@ -572,15 +549,10 @@ async function openDoc(path: string, paneIndex = activePane.value) {
     if (paneRequestIds.get(paneIndex) !== requestId) return;
     const pane = panes.value[paneIndex];
     if (!pane) return;
+    selectedAnnotation.value = null;
     pane.path = path;
     pane.outlineOpen = false;
-    if (path === 'AGENTS.md') pane.mode = 'source';
-    else if (
-      lockSource(path) ||
-      (docs.value[path]?.content.length ?? 0) >= virtualDocumentThreshold
-    )
-      pane.mode = 'preview';
-    else pane.mode = 'rendered';
+    pane.mode = 'rendered';
     activePane.value = paneIndex;
     panel.value = 'none';
   } catch (error) {
@@ -635,7 +607,7 @@ async function revealPendingJump(index: number) {
   const jump = pendingJump;
   if (!jump || jump.paneIndex !== index || panes.value[index]?.path !== jump.path) return;
   if (jump.annotationId && panes.value[index]?.mode !== 'source') {
-    const editor = renderedEditors[index];
+    const editor = renderedEditors.get(panes.value[index]?.id ?? -1);
     if (!editor) return;
     const found = await editor.revealAnnotation(jump.annotationId);
     if (pendingJump !== jump) return;
@@ -665,8 +637,7 @@ async function jumpToHeading(index: number, offset: number) {
   const pane = panes.value[index];
   if (!pane?.path) return;
   activePane.value = index;
-  pane.outlineOpen = false;
-  if (pane.mode === 'source' || pane.path === 'AGENTS.md') {
+  if (pane.mode === 'source') {
     sourceRevealRequests.value[index] = { offset, length: 0, token: ++revealToken };
     return;
   }
@@ -679,7 +650,7 @@ async function revealPendingHeading(index: number) {
   if (headingJumpsInFlight.has(index)) return;
   const jump = pendingHeadingJumps.get(index);
   if (!jump || panes.value[index]?.path !== jump.path) return;
-  const editor = renderedEditors[index];
+  const editor = renderedEditors.get(panes.value[index]?.id ?? -1);
   if (!editor) return;
   headingJumpsInFlight.add(index);
   try {
@@ -697,24 +668,41 @@ async function revealPendingHeading(index: number) {
   }
 }
 
-function setSourceEditor(value: unknown, index: number) {
-  sourceEditors[index] = value as EditorHandle | null;
-}
-function sourceEditorRef(index: number) {
-  return (sourceEditorRefs[index] ??= (value) => setSourceEditor(value, index));
-}
-function setRenderedEditor(value: unknown, index: number) {
-  if (renderedEditors[index] === value) return;
-  renderedEditors[index] = value as RenderedEditorHandle | null;
-  if (value) {
-    void revealPendingJump(index);
-    void revealPendingHeading(index);
+function sourceEditorRef(id: number) {
+  let callback = sourceEditorRefs.get(id);
+  if (!callback) {
+    callback = (value) => sourceEditors.set(id, value as EditorHandle | null);
+    sourceEditorRefs.set(id, callback);
   }
+  return callback;
 }
-function renderedEditorRef(index: number) {
-  return (renderedEditorRefs[index] ??= (value) => setRenderedEditor(value, index));
+function renderedEditorRef(id: number) {
+  let callback = renderedEditorRefs.get(id);
+  if (!callback) {
+    callback = (value) => {
+      renderedEditors.set(id, value as RenderedEditorHandle | null);
+      const index = panes.value.findIndex((pane) => pane.id === id);
+      if (value && index >= 0) {
+        void revealPendingJump(index);
+        void revealPendingHeading(index);
+      }
+    };
+    renderedEditorRefs.set(id, callback);
+  }
+  return callback;
+}
+function flushEditors() {
+  for (const editor of renderedEditors.values()) editor?.flush();
+}
+function setMode(index: number, mode: Mode) {
+  const pane = panes.value[index];
+  if (!pane || pane.mode === mode) return;
+  renderedEditors.get(pane.id)?.flush();
+  activePane.value = index;
+  pane.mode = mode;
 }
 async function formatOne(path: string, manual = false) {
+  if (manual) flushEditors();
   const doc = docs.value[path];
   if (!doc || doc.conflict || lockSource(path) || formattingPaths.value.has(path)) return;
   const original = doc.content;
@@ -785,7 +773,7 @@ function setContent(path: string, content: string) {
       markContents.value = { ...markContents.value, [path]: doc.content };
     }, 250),
   );
-  if (path !== 'AGENTS.md' && nativeAvailable()) {
+  if (nativeAvailable()) {
     const previousTimer = draftTimers.get(path);
     if (previousTimer) clearTimeout(previousTimer);
     const sequence = (draftSequences.get(path) ?? 0) + 1;
@@ -797,8 +785,9 @@ function setContent(path: string, content: string) {
         if (docs.value[path] !== doc || doc.content !== content) return;
         void publishDraft(path, content, doc.revision, sequence).catch((error) => {
           if (draftSequences.get(path) !== sequence) return;
-          doc.conflict = true;
-          report(error);
+          if (docs.value[path] !== doc) return;
+          if (/修改|冲突|版本/.test(errorMessage(error))) void reload(path, doc).catch(report);
+          else report(error);
         });
       }, 750),
     );
@@ -825,21 +814,10 @@ async function saveOne(path: string) {
   draftSequences.set(path, (draftSequences.get(path) ?? 0) + 1);
   const submitted = doc.content;
   try {
-    const saved =
-      path === 'AGENTS.md'
-        ? await saveProjectRules({
-            path,
-            content: submitted,
-            revision: doc.revision,
-          })
-        : await saveDocument({
-            path,
-            content: submitted,
-            revision: doc.revision,
-          });
+    const saved = await saveDocument({ path, content: submitted, revision: doc.revision });
     doc.revision = saved.revision;
     doc.savedContent = submitted;
-    if (doc.content !== submitted && path !== 'AGENTS.md' && nativeAvailable()) {
+    if (doc.content !== submitted && nativeAvailable()) {
       const sequence = (draftSequences.get(path) ?? 0) + 1;
       draftSequences.set(path, sequence);
       void publishDraft(path, doc.content, saved.revision, sequence).catch((error) => {
@@ -847,67 +825,53 @@ async function saveOne(path: string) {
       });
     }
   } catch (error) {
-    if (errorMessage(error).includes('修改')) doc.conflict = true;
-    report(error);
+    if (/修改|冲突|版本/.test(errorMessage(error))) await reload(path, doc).catch(report);
+    else report(error);
   } finally {
     doc.saving = false;
   }
 }
 async function saveAll() {
+  flushEditors();
   await Promise.all(Object.keys(docs.value).map(saveOne));
 }
+let checkingDisk = false;
 async function checkDisk() {
-  if (!project.value) return;
-  for (const doc of Object.values(docs.value)) {
-    if (doc.conflict || doc.saving) continue;
-    const expectedRevision = doc.revision;
-    try {
-      const revision = await readDocumentRevision(doc.path);
-      if (!doc.saving && doc.revision === expectedRevision && revision !== expectedRevision)
-        doc.conflict = true;
-    } catch {
-      /* A later user action reports an inaccessible file. */
+  if (!project.value || checkingDisk) return;
+  checkingDisk = true;
+  const currentProject = project.value;
+  try {
+    for (const doc of Object.values(docs.value)) {
+      if (doc.saving) continue;
+      const expectedRevision = doc.revision;
+      try {
+        const revision = await readDocumentRevision(doc.path);
+        if (project.value !== currentProject) return;
+        if (docs.value[doc.path] !== doc || doc.saving || doc.revision !== expectedRevision)
+          continue;
+        if (doc.conflict || revision !== expectedRevision) await reload(doc.path, doc);
+      } catch {
+        // A temporary missing file during an external atomic save is retried.
+      }
     }
+  } finally {
+    checkingDisk = false;
   }
 }
-async function reload(path: string) {
-  const doc = docs.value[path];
-  if (
-    doc &&
-    doc.content !== doc.savedContent &&
-    !(await confirmAction(
-      translate(
-        '重新加载会丢弃当前未保存内容，确定继续吗？',
-        'Reloading will discard unsaved changes. Continue?',
-      ),
-    ))
-  )
-    return;
-  try {
-    remember(path === 'AGENTS.md' ? await readProjectRules() : await readDocument(path));
-  } catch (error) {
-    report(error);
-  }
-}
-async function saveCopy(path: string) {
-  const doc = docs.value[path];
-  if (!doc) return;
-  const slash = path.lastIndexOf('/');
-  const directory = slash < 0 ? '' : path.slice(0, slash);
-  const name = await requestText(
-    translate('另存为新文档', 'Save as a new document'),
-    path.slice(slash + 1).replace(/\.md$/i, '-副本.md'),
+async function reload(path: string, expected = docs.value[path]) {
+  if (!expected || docs.value[path] !== expected) return;
+  const currentProject = project.value;
+  expected.conflict = true;
+  const draftTimer = draftTimers.get(path);
+  if (draftTimer) clearTimeout(draftTimer);
+  draftTimers.delete(path);
+  draftSequences.set(path, (draftSequences.get(path) ?? 0) + 1);
+  const loaded = await reloadDocument(path);
+  if (project.value !== currentProject || docs.value[path] !== expected) return;
+  formatSnapshots.value = Object.fromEntries(
+    Object.entries(formatSnapshots.value).filter(([key]) => key !== path),
   );
-  if (!name) return;
-  try {
-    const created = await createDocument(directory, name.endsWith('.md') ? name : `${name}.md`);
-    const saved = await saveDocument({ ...created, content: doc.content });
-    remember(saved);
-    await refresh();
-    await openDoc(saved.path);
-  } catch (error) {
-    report(error);
-  }
+  remember(loaded);
 }
 async function addDoc(directory = '') {
   const name = await requestText(
@@ -952,6 +916,7 @@ async function showInFinder(path?: string) {
   }
 }
 async function action(kind: 'rename' | 'move' | 'delete' | 'pin' | 'lock') {
+  flushEditors();
   const node = context.value;
   context.value = null;
   if (!node) return;
@@ -1027,43 +992,6 @@ async function runSearch() {
   }
 }
 
-async function showHistory() {
-  const request = ++historyRequest;
-  historyLoading.value = true;
-  panel.value = 'history';
-  history.value = [];
-  try {
-    const entries = await listHistory();
-    if (request === historyRequest) history.value = entries;
-  } catch (error) {
-    report(error);
-  } finally {
-    if (request === historyRequest) historyLoading.value = false;
-  }
-}
-
-async function undo(id: string) {
-  try {
-    await undoChange(id);
-    history.value = await listHistory();
-    await refresh();
-    await checkDisk();
-  } catch (error) {
-    report(error);
-  }
-}
-
-async function showBridgeInfo() {
-  try {
-    const info = await bridgeInfo();
-    message.value = translate(
-      `Codex 接口：${info.url}；连接令牌见 ${info.configPath}`,
-      `Codex endpoint: ${info.url}; token: ${info.configPath}`,
-    );
-  } catch (error) {
-    report(error);
-  }
-}
 async function termAction(term?: Term) {
   termDialog.value = {
     id: term?.id ?? null,
@@ -1099,6 +1027,9 @@ function count(kind: AnnotationKind) {
 function locate(annotation: Annotation, content: string): number | null {
   return resolveAnnotation(content, annotation);
 }
+const annotationsById = computed(
+  () => new Map(data.value.annotations.map((annotation) => [annotation.id, annotation])),
+);
 const annotationMarksByDocument = computed(() => {
   const marks: Record<string, ReturnType<typeof annotationMarks>> = {};
   for (const pane of panes.value) {
@@ -1113,18 +1044,42 @@ const annotationMarksByDocument = computed(() => {
 function positionAnnotationPopover() {
   if (!annotationAnchor?.isConnected || !selectedAnnotation.value) return;
   const rect = annotationAnchor.getBoundingClientRect();
+  const canvas = annotationAnchor
+    .closest('section[data-pane-index]')
+    ?.querySelector('.markdown-canvas');
+  if (!canvas) return;
+  const bounds = canvas.getBoundingClientRect();
+  annotationPopoverSize.value = {
+    width: Math.floor((bounds.width * 2) / 3),
+    height: Math.floor((bounds.height * 2) / 3),
+  };
   const card = document.getElementById('vivin-annotation-popover');
-  const cardWidth = card?.offsetWidth ?? 320;
-  const cardHeight = card?.offsetHeight ?? 160;
-  const below = rect.bottom + 8;
+  const width = Math.min(card?.offsetWidth ?? 200, annotationPopoverSize.value.width);
+  const height = Math.min(card?.offsetHeight ?? 120, annotationPopoverSize.value.height);
   annotationPopoverAt.value = {
-    x: Math.max(12, Math.min(rect.left, window.innerWidth - cardWidth - 12)),
-    y:
-      below + cardHeight <= window.innerHeight - 12
-        ? below
-        : Math.max(12, rect.top - cardHeight - 8),
+    x: Math.max(bounds.left, Math.min(rect.left, bounds.right - width)),
+    y: Math.max(
+      bounds.top,
+      Math.min(
+        rect.bottom + 8 + height <= bounds.bottom ? rect.bottom + 8 : rect.top - height - 8,
+        bounds.bottom - height,
+      ),
+    ),
   };
 }
+watch(selectedAnnotation, async (annotation) => {
+  annotationResizeObserver?.disconnect();
+  if (!annotation) return;
+  await nextTick();
+  positionAnnotationPopover();
+  const card = document.getElementById('vivin-annotation-popover');
+  const canvas = annotationAnchor
+    ?.closest('section[data-pane-index]')
+    ?.querySelector('.markdown-canvas');
+  annotationResizeObserver = new ResizeObserver(positionAnnotationPopover);
+  if (card) annotationResizeObserver.observe(card);
+  if (canvas) annotationResizeObserver.observe(canvas);
+});
 function showAnnotationPopover(annotation: Annotation, element: Element) {
   if (hideAnnotationTimer) clearTimeout(hideAnnotationTimer);
   if (annotationEditing.value) return;
@@ -1158,7 +1113,7 @@ function handleAnnotationHover(event: MouseEvent) {
   if (!(target instanceof Element)) return;
   const mark = target.closest('[data-annotation-id]');
   const id = mark?.getAttribute('data-annotation-id');
-  const annotation = data.value.annotations.find((item) => item.id === id);
+  const annotation = annotationsById.value.get(id ?? '');
   if (annotation && mark) showAnnotationPopover(annotation, mark);
   else if (selectedAnnotation.value && !hideAnnotationTimer) scheduleHideAnnotationPopover();
 }
@@ -1167,7 +1122,7 @@ function handleEditorClick(event: MouseEvent) {
   if (!(target instanceof Element)) return;
   const mark = target.closest('[data-annotation-id]');
   const id = mark?.getAttribute('data-annotation-id');
-  const annotation = data.value.annotations.find((item) => item.id === id);
+  const annotation = annotationsById.value.get(id ?? '');
   if (annotation && mark) showAnnotationPopover(annotation, mark);
 }
 
@@ -1344,11 +1299,13 @@ async function addAnnotation(
 ) {
   const path = activePath.value;
   const doc = current.value;
-  if (!path || !doc || lockSource(path) || path === 'AGENTS.md') return;
+  if (!path || !doc || lockSource(path)) return;
   const pane = panes.value[activePane.value];
   let selected =
     selectedOverride ??
-    (pane?.mode === 'source' ? sourceEditors[activePane.value]?.selectedText() : null);
+    (pane?.mode === 'source'
+      ? sourceEditors.get(panes.value[activePane.value]?.id ?? -1)?.selectedText()
+      : null);
   if (!selected && pane?.mode === 'rendered') {
     const selection = window.getSelection();
     const range = selection && !selection.isCollapsed ? selection.getRangeAt(0) : null;
@@ -1442,18 +1399,21 @@ async function removeAnnotation(annotation: Annotation) {
     report(error);
   }
 }
+function closePane(index: number) {
+  flushEditors();
+  if (panes.value.length <= 1) return;
+  selectedAnnotation.value = null;
+  panes.value.splice(index, 1);
+  sourceRevealRequests.value.splice(index, 1);
+  pendingJump = null;
+  pendingHeadingJumps.clear();
+  paneRequestIds.clear();
+  loadingPanes.value.clear();
+  activePane.value = Math.max(0, activePane.value - (index <= activePane.value ? 1 : 0));
+}
 function toggleSplit() {
-  if (panes.value.length === 2) {
-    panes.value.splice(1);
-    pendingHeadingJumps.delete(1);
-    activePane.value = 0;
-  } else
-    panes.value.push({
-      path: activePath.value,
-      mode: 'source',
-      outlineOpen: false,
-      filters: kinds.map((kind) => kind.value),
-    });
+  if (panes.value.length === 2) closePane(activePane.value);
+  else panes.value.push({ ...emptyPane(), path: activePath.value, mode: 'source' });
 }
 function resize(event: PointerEvent) {
   const handle = event.currentTarget;
@@ -1528,14 +1488,19 @@ function shortcut(event: KeyboardEvent) {
     context.value = null;
     more.value = false;
     projectMenu.value = false;
-    switcher.value = false;
     for (const pane of panes.value) pane.outlineOpen = false;
   }
 }
 onMounted(() => {
   window.addEventListener('keydown', shortcut);
+  window.addEventListener('scroll', positionAnnotationPopover, true);
   window.addEventListener('resize', clampSidebarOnWindowResize);
   if (nativeAvailable()) {
+    void getPlatform()
+      .then((value) => {
+        platform.value = value;
+      })
+      .catch(report);
     const currentWindow = getCurrentWindow();
     const syncWindowSize = async () => {
       windowExpanded.value =
@@ -1547,6 +1512,7 @@ onMounted(() => {
     void currentWindow
       .onCloseRequested(async (event) => {
         if (closing) return;
+        flushEditors();
         if (!dirty.value && !closePromptActive) return;
         event.preventDefault();
         if (closePromptActive) return;
@@ -1608,30 +1574,12 @@ onMounted(() => {
       searchRan.value = false;
       searchRequest++;
       searching.value = false;
-      historyRequest++;
-      historyLoading.value = false;
-      history.value = [];
     }).then((stop) => unlisten.push(stop));
-    void listen<{ document: Document; beforeContent: string }>(
-      'vivin://document-written',
-      (event) => {
-        const local = docs.value[event.payload.document.path];
-        if (!local) return;
-        if (local.content !== event.payload.beforeContent) {
-          local.conflict = true;
-          return;
-        }
-        remember(event.payload.document);
-      },
-    ).then((stop) => unlisten.push(stop));
+    void listen<{ document: Document }>('vivin://document-written', (event) => {
+      void reload(event.payload.document.path).catch(report);
+    }).then((stop) => unlisten.push(stop));
     void listen<string>('vivin://document-changed', (event) => {
-      const doc = docs.value[event.payload];
-      if (!doc) return;
-      if (doc.content !== doc.savedContent) {
-        doc.conflict = true;
-        return;
-      }
-      void readDocument(event.payload).then(remember).catch(report);
+      void reload(event.payload).catch(report);
     }).then((stop) => unlisten.push(stop));
     void listen('vivin://project-changed', () => {
       if (project.value) void refresh();
@@ -1662,6 +1610,8 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', shortcut);
+  window.removeEventListener('scroll', positionAnnotationPopover, true);
+  annotationResizeObserver?.disconnect();
   window.removeEventListener('resize', clampSidebarOnWindowResize);
   if (saveTimer) clearTimeout(saveTimer);
   for (const timer of draftTimers.values()) clearTimeout(timer);
@@ -1681,12 +1631,11 @@ onBeforeUnmount(() => {
         : 'm-2 h-[calc(100vh-16px)] rounded-xl shadow-[0_4px_14px_-3px_rgb(15_23_42_/_18%)]',
       theme === 'dark' ? 'theme-dark' : '',
     ]"
+    :data-document-theme="documentTheme"
     @click="
       context = null;
       projectMenu = false;
-      switcher = false;
       more = false;
-      panes.forEach((pane) => (pane.outlineOpen = false));
     "
   >
     <AppTitlebar :sidebar-open="sidebar" :sidebar-width="sidebarWidth" :locale="locale">
@@ -1700,58 +1649,9 @@ onBeforeUnmount(() => {
         </button>
       </template>
       <div class="relative flex min-w-0 items-center gap-2">
-        <button
-          class="flex min-w-0 items-center gap-1 rounded-md px-1.5 py-1 text-sm font-semibold hover:bg-slate-200/70"
-          :title="project?.path || translate('切换项目', 'Switch project')"
-          :aria-label="translate('切换项目', 'Switch project')"
-          @click.stop="
-            switcher = !switcher;
-            projectMenu = false;
-            more = false;
-          "
-        >
-          <span class="truncate">{{ project?.name || 'vivin' }}</span>
-          <ChevronDown :size="14" class="shrink-0 text-slate-500" />
-        </button>
-        <div
-          v-if="switcher"
-          class="absolute left-0 top-9 z-40 w-72 rounded-xl bg-white p-1.5 text-sm shadow-xl"
-          role="menu"
-        >
-          <p class="px-2 py-1 text-xs text-slate-400">
-            {{ translate('最近项目', 'Recent projects') }}
-          </p>
-          <p v-if="project" class="mb-1 break-all px-2 text-[11px] text-slate-500">
-            {{ translate('当前项目：', 'Current project: ') }}{{ project.path }}
-          </p>
-          <div v-if="recentProjects.length === 0" class="px-2 py-3 text-center">
-            <img src="/empty-project-files.svg" alt="" class="mx-auto mb-1 h-16 w-24" />
-            <p class="text-xs text-slate-400">
-              {{ translate('还没有最近项目', 'No recent projects') }}
-            </p>
-          </div>
-          <button
-            v-for="item in recentProjects"
-            :key="item.path"
-            class="block w-full truncate rounded-lg px-2 py-2 text-left hover:bg-slate-100"
-            :title="item.path"
-            role="menuitem"
-            @click.stop="switchRecent(item.path)"
-          >
-            {{ item.name
-            }}<span v-if="project?.path === item.path" class="ml-2 text-blue-600">✓</span
-            ><span class="block truncate text-[11px] font-normal text-slate-400">{{
-              item.path
-            }}</span>
-          </button>
-          <button
-            class="mt-1 block w-full rounded-lg px-2 py-2 text-left text-blue-600 hover:bg-slate-100"
-            role="menuitem"
-            @click.stop="switchProject(false)"
-          >
-            {{ translate('打开其他项目…', 'Open another project…') }}
-          </button>
-        </div>
+        <span class="min-w-0 truncate px-1.5 text-sm font-semibold" :title="project?.path">{{
+          project?.name || 'vivin'
+        }}</span>
         <LoaderCircle
           v-if="busy || refreshing"
           :size="15"
@@ -1846,17 +1746,9 @@ onBeforeUnmount(() => {
             >
               <button
                 class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
-                @click.stop="
-                  more = false;
-                  openDoc('AGENTS.md');
-                "
-              >
-                {{ translate('编辑项目规则', 'Edit project rules') }}</button
-              ><button
-                class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
                 @click.stop="showInFinder()"
               >
-                {{ translate('在 Finder 中显示项目', 'Show project in Finder') }}</button
+                {{ revealLabel }}</button
               ><button
                 class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
                 @click.stop="
@@ -1864,27 +1756,26 @@ onBeforeUnmount(() => {
                   panel = 'terms';
                 "
               >
-                {{ translate('项目术语', 'Project terms') }}</button
-              ><button
-                class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
-                @click.stop="
-                  more = false;
-                  showHistory();
-                "
-              >
-                {{ translate('AI 修改记录', 'AI edit history') }}</button
-              ><button
-                class="w-full rounded-lg px-3 py-2 text-left hover:bg-slate-100"
-                @click.stop="
-                  more = false;
-                  showBridgeInfo();
-                "
-              >
-                {{ translate('Codex 连接信息', 'Codex connection') }}
+                {{ translate('项目术语', 'Project terms') }}
               </button>
             </div>
           </div>
         </template>
+        <label
+          class="flex items-center gap-1 rounded-md px-1.5 py-1 text-slate-600"
+          :title="translate('Markdown 主题', 'Markdown theme')"
+        >
+          <Palette :size="17" />
+          <select
+            v-model="documentTheme"
+            class="max-w-24 cursor-pointer bg-transparent text-xs"
+            :aria-label="translate('Markdown 主题', 'Markdown theme')"
+          >
+            <option v-for="item in documentThemes" :key="item.value" :value="item.value">
+              {{ item.label }}
+            </option>
+          </select>
+        </label>
         <button
           class="rounded-md p-1.5 hover:bg-slate-200/70"
           :title="translate('切换语言', 'Switch language')"
@@ -2129,7 +2020,7 @@ onBeforeUnmount(() => {
           class="relative flex min-h-0 flex-1"
         >
           <div class="flex min-w-0 flex-1">
-            <template v-for="(pane, index) in panes" :key="index"
+            <template v-for="(pane, index) in panes" :key="pane.id"
               ><div
                 v-if="index === 1"
                 v-show="!readingPanel"
@@ -2146,7 +2037,7 @@ onBeforeUnmount(() => {
                     ? { flex: `${index === 0 ? split : 100 - split} 1 0%` }
                     : {}
                 "
-                class="flex min-w-0 flex-1 flex-col overflow-hidden bg-white rounded-2xl"
+                class="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-white rounded-2xl"
                 @pointerdown="activePane = index"
                 @click.capture="handleEditorClick"
                 @mousemove="
@@ -2158,6 +2049,15 @@ onBeforeUnmount(() => {
                   scheduleHideAnnotationPopover();
                 "
               >
+                <button
+                  v-if="panes.length > 1"
+                  class="absolute right-2 top-2 z-20 rounded-md p-1 text-slate-400 hover:bg-slate-100"
+                  :title="translate('关闭分栏', 'Close pane')"
+                  :aria-label="translate('关闭分栏', 'Close pane')"
+                  @click.stop="closePane(index)"
+                >
+                  <X :size="15" />
+                </button>
                 <Transition name="document-switch" mode="out-in">
                   <LoadingState
                     v-if="loadingPanes.has(index)"
@@ -2168,7 +2068,10 @@ onBeforeUnmount(() => {
                     :key="pane.path"
                     class="flex min-h-0 flex-1 flex-col"
                   >
-                    <div class="document-toolbar relative shrink-0 text-sm">
+                    <div
+                      class="document-toolbar relative shrink-0 text-sm"
+                      :style="panes.length > 1 ? { paddingRight: '40px' } : undefined"
+                    >
                       <span
                         :class="[
                           'min-w-0 flex-1 truncate font-medium',
@@ -2202,7 +2105,7 @@ onBeforeUnmount(() => {
                           :class="pane.outlineOpen ? 'bg-blue-50 text-blue-700' : ''"
                           :title="translate('文档目录', 'Document outline')"
                           :aria-label="translate('文档目录', 'Document outline')"
-                          :aria-controls="`vivin-outline-${index}`"
+                          :aria-controls="`vivin-outline-${pane.id}`"
                           :aria-expanded="pane.outlineOpen"
                           @click.stop="toggleOutline(index)"
                         >
@@ -2214,44 +2117,29 @@ onBeforeUnmount(() => {
                           :aria-label="translate('文档视图', 'Document view')"
                         >
                           <button
-                            v-for="mode in ['source', 'rendered', 'preview'] as const"
+                            v-for="mode in ['source', 'rendered'] as const"
                             :key="mode"
                             class="view-switch-button disabled:opacity-40"
                             :class="pane.mode === mode ? 'is-active' : ''"
-                            :disabled="
-                              (mode === 'rendered' && !!lockSource(pane.path)) ||
-                              (mode !== 'source' && pane.path === 'AGENTS.md')
-                            "
                             :title="
                               mode === 'source'
-                                ? translate('原文', 'Source')
-                                : mode === 'rendered'
-                                  ? translate('排版编辑', 'Edit')
-                                  : translate('只读预览', 'Preview')
+                                ? translate('源代码模式', 'Source mode')
+                                : translate('视图模式', 'View mode')
                             "
                             :aria-label="
                               mode === 'source'
-                                ? translate('原文', 'Source')
-                                : mode === 'rendered'
-                                  ? translate('排版编辑', 'Edit')
-                                  : translate('只读预览', 'Preview')
+                                ? translate('源代码模式', 'Source mode')
+                                : translate('视图模式', 'View mode')
                             "
                             :aria-pressed="pane.mode === mode"
-                            @click.stop="
-                              activePane = index;
-                              pane.mode = mode;
-                              pane.outlineOpen = false;
-                            "
+                            @click.stop="setMode(index, mode)"
                           >
                             <CodeXml v-if="mode === 'source'" :size="14" />
-                            <BookOpenText v-else-if="mode === 'rendered'" :size="14" />
-                            <Eye v-else :size="14" />
+                            <BookOpenText v-else :size="14" />
                             <span>{{
                               mode === 'source'
-                                ? translate('原文', 'Source')
-                                : mode === 'rendered'
-                                  ? translate('编辑', 'Edit')
-                                  : translate('预览', 'Preview')
+                                ? translate('源代码', 'Source')
+                                : translate('视图', 'View')
                             }}</span>
                           </button>
                         </div>
@@ -2301,123 +2189,59 @@ onBeforeUnmount(() => {
                           }}</span>
                         </label>
                       </div>
+                    </div>
+                    <div class="flex min-h-0 flex-1">
                       <MarkdownOutlinePanel
                         v-if="pane.outlineOpen"
-                        :panel-id="`vivin-outline-${index}`"
+                        :panel-id="`vivin-outline-${pane.id}`"
                         :markdown="docs[pane.path]?.content ?? ''"
                         :locale="locale"
                         @select="jumpToHeading(index, $event)"
                       />
-                    </div>
-                    <div v-if="pane.mode === 'preview'" class="preview-notice">
-                      <Eye :size="13" /><span
-                        >{{ translate('只读预览', 'Read-only preview')
-                        }}{{
-                          (docs[pane.path]?.content.length ?? 0) >= virtualDocumentThreshold
-                            ? translate(' · 长文按需渲染', ' · Long document rendered on demand')
-                            : ''
-                        }}</span
-                      >
-                      <button
-                        v-if="!lockSource(pane.path)"
-                        class="ml-auto hover:underline"
-                        @click="pane.mode = 'source'"
-                      >
-                        {{ translate('编辑原文', 'Edit source') }}
-                      </button>
-                    </div>
-                    <div
-                      v-if="docs[pane.path]?.conflict"
-                      class="flex flex-wrap items-center gap-2 bg-amber-50 px-4 py-2 text-xs text-amber-900"
-                    >
-                      <span>{{
-                        translate(
-                          '磁盘上的文档已改变，自动保存已暂停。',
-                          'The document changed on disk. Autosave is paused.',
-                        )
-                      }}</span
-                      ><button class="underline" @click.stop="reload(pane.path!)">
-                        {{ translate('重新加载磁盘版本', 'Reload disk version') }}</button
-                      ><button
-                        v-if="pane.path !== 'AGENTS.md'"
-                        class="underline"
-                        @click.stop="saveCopy(pane.path!)"
-                      >
-                        {{
-                          translate(
-                            '将当前内容另存为新文档',
-                            'Save current content as a new document',
-                          )
-                        }}
-                      </button>
-                    </div>
-                    <div class="flex min-h-0 flex-1">
-                      <MarkdownSourceEditor
-                        v-if="pane.mode === 'source' || pane.path === 'AGENTS.md'"
-                        :key="`${index}:${pane.path}:source`"
-                        :ref="sourceEditorRef(index)"
-                        :model-value="docs[pane.path]?.content ?? ''"
-                        :document-path="pane.path"
-                        :reveal-request="sourceRevealRequests[index] ?? undefined"
-                        :annotations="annotationMarksByDocument[pane.path]"
-                        :readonly="!!lockSource(pane.path)"
-                        :locale="locale"
-                        class="min-w-0 flex-1"
-                        @update:model-value="setContent(pane.path!, $event)"
-                        @error="message = $event"
-                        @annotation-request="
-                          (kind, selected) => {
-                            activePane = index;
-                            addAnnotation(kind, selected);
-                          }
-                        "
-                      />
-                      <MarkdownPreview
-                        v-else-if="pane.mode === 'preview'"
-                        :key="`${index}:${pane.path}:preview`"
-                        :ref="renderedEditorRef(index)"
-                        :model-value="docs[pane.path]?.content ?? ''"
-                        :document-path="pane.path"
-                        :locale="locale"
-                        :theme="theme"
-                        class="min-w-0 flex-1"
-                        @error="message = $event"
-                        @open-reference="openReference(pane.path!, $event)"
-                      />
-                      <component
-                        v-else
-                        :is="
-                          (docs[pane.path]?.content.length ?? 0) >= virtualDocumentThreshold
-                            ? MarkdownVirtualEditor
-                            : MarkdownRenderedEditor
-                        "
-                        :key="`${index}:${pane.path}:rendered:${locale}:${theme}:${(docs[pane.path]?.content.length ?? 0) >= virtualDocumentThreshold ? 'virtual' : 'single'}`"
-                        :ref="renderedEditorRef(index)"
-                        :model-value="docs[pane.path]?.content ?? ''"
-                        :document-path="pane.path"
-                        :annotations="annotationMarksByDocument[pane.path]"
-                        :terms="termMarksByDocument[pane.path]"
-                        :locale="locale"
-                        class="min-w-0 flex-1"
-                        @update:model-value="setContent(pane.path!, $event)"
-                        @error="message = $event"
-                        @open-reference="openReference(pane.path!, $event)"
-                        @annotation-request="
-                          (kind: AnnotationKind, selected: { quote: string; offset: number }) =>
-                            requestEditorAnnotation(index, kind, selected)
-                        "
-                        @incompatible="
-                          pane.mode = 'preview';
-                          message = translate(
-                            '此 Markdown 无法安全排版编辑，已打开只读预览；可切换原文编辑',
-                            'Opened read-only preview to preserve this Markdown. Switch to source to edit.',
-                          );
-                        "
-                      />
-                      <div
-                        v-if="pane.path !== 'AGENTS.md'"
-                        class="relative flex w-8 shrink-0 flex-col items-center py-2"
-                      >
+                      <div class="markdown-canvas flex min-h-0 min-w-0 flex-1">
+                        <MarkdownSourceEditor
+                          v-if="pane.mode === 'source'"
+                          :key="`${pane.id}:${pane.path}:source`"
+                          :ref="sourceEditorRef(pane.id)"
+                          :model-value="docs[pane.path]?.content ?? ''"
+                          :document-path="pane.path"
+                          :reveal-request="sourceRevealRequests[index] ?? undefined"
+                          :annotations="annotationMarksByDocument[pane.path]"
+                          :readonly="!!lockSource(pane.path)"
+                          :locale="locale"
+                          class="min-w-0 flex-1"
+                          @update:model-value="setContent(pane.path!, $event)"
+                          @error="message = $event"
+                          @annotation-request="
+                            (kind, selected) => {
+                              activePane = index;
+                              addAnnotation(kind, selected);
+                            }
+                          "
+                        />
+                        <MarkdownRenderedEditor
+                          v-else
+                          :key="`${pane.id}:${pane.path}:rendered`"
+                          :ref="renderedEditorRef(pane.id)"
+                          :model-value="docs[pane.path]?.content ?? ''"
+                          :document-path="pane.path"
+                          :annotations="annotationMarksByDocument[pane.path]"
+                          :terms="termMarksByDocument[pane.path]"
+                          :locale="locale"
+                          :readonly="!!lockSource(pane.path)"
+                          :theme="theme"
+                          class="min-w-0 flex-1"
+                          @update:model-value="setContent(pane.path!, $event)"
+                          @error="message = $event"
+                          @open-reference="openReference(pane.path!, $event)"
+                          @annotation-request="
+                            (kind: AnnotationKind, selected: { quote: string; offset: number }) =>
+                              requestEditorAnnotation(index, kind, selected)
+                          "
+                          @incompatible="setMode(index, 'source')"
+                        />
+                      </div>
+                      <div class="relative flex w-8 shrink-0 flex-col items-center py-2">
                         <div class="group relative mb-2">
                           <button
                             :title="translate('筛选缩略图标注', 'Filter annotation minimap')"
@@ -2533,9 +2357,7 @@ onBeforeUnmount(() => {
                   ? translate('项目搜索', 'Project search')
                   : panel === 'terms'
                     ? translate('项目术语', 'Project terms')
-                    : panel === 'history'
-                      ? translate('AI 修改记录', 'AI edit history')
-                      : translate('项目标注', 'Project annotations')
+                    : translate('项目标注', 'Project annotations')
               }}</span
               ><button
                 class="rounded p-1 hover:bg-slate-100"
@@ -2723,46 +2545,6 @@ onBeforeUnmount(() => {
                 </div>
               </button>
             </div>
-            <div v-else-if="panel === 'history'" class="min-h-0 flex-1 overflow-y-auto px-8 py-7">
-              <div class="reading-page mx-auto max-w-[860px]">
-                <h1>{{ translate('AI 修改记录', 'AI edit history') }}</h1>
-                <LoadingState
-                  v-if="historyLoading"
-                  :label="translate('正在读取修改记录…', 'Loading edit history…')"
-                />
-                <EmptyPanel
-                  v-else-if="history.length === 0"
-                  :label="translate('暂无 AI 修改记录。', 'No AI edit history yet.')"
-                />
-                <section v-for="entry in history" :key="entry.id" class="mb-10">
-                  <h2 class="break-words">{{ entry.operation }}</h2>
-                  <p class="mt-1 break-all text-base leading-7">{{ entry.target }}</p>
-                  <p class="mt-1 text-sm text-slate-500">
-                    {{ new Date(entry.time * 1000).toLocaleString() }}
-                  </p>
-                  <details
-                    v-if="entry.beforeContent !== null || entry.afterContent !== null"
-                    class="mt-4"
-                  >
-                    <summary class="cursor-pointer text-sm text-blue-600">
-                      {{ translate('查看修改内容', 'View changes') }}
-                    </summary>
-                    <pre
-                      class="mt-3 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-50 p-4 text-xs leading-6"
-                      >{{ translate('修改前：', 'Before: ')
-                      }}{{ entry.beforeContent ?? translate('不存在', 'Not present') }}\n{{
-                        translate('修改后：', 'After: ')
-                      }}{{ entry.afterContent ?? translate('不存在', 'Not present') }}</pre>
-                  </details>
-                  <button
-                    class="mt-4 rounded-md px-2 py-1 text-sm text-blue-600 hover:bg-blue-50"
-                    @click.stop="undo(entry.id)"
-                  >
-                    {{ translate('撤销这次修改', 'Undo this change') }}
-                  </button>
-                </section>
-              </div>
-            </div>
           </aside>
         </div>
       </div>
@@ -2827,7 +2609,7 @@ onBeforeUnmount(() => {
         class="block w-full rounded px-2 py-1.5 text-left hover:bg-slate-100"
         @click="showInFinder(context!.path)"
       >
-        {{ translate('在 Finder 中显示', 'Show in Finder') }}</button
+        {{ revealLabel }}</button
       ><button
         class="block w-full rounded px-2 py-1.5 text-left hover:bg-slate-100"
         @click="action('rename')"
@@ -2881,10 +2663,12 @@ onBeforeUnmount(() => {
     <div
       v-if="selectedAnnotation"
       id="vivin-annotation-popover"
-      class="fixed z-50 w-80 max-w-[calc(100vw-24px)] rounded-xl bg-white p-4 text-sm shadow-xl ring-1 ring-slate-200/70"
+      class="fixed z-50 flex w-max flex-col overflow-hidden rounded-lg bg-white text-sm shadow-xl ring-1 ring-slate-200/70"
       :style="{
         left: `${annotationPopoverAt.x}px`,
         top: `${annotationPopoverAt.y}px`,
+        maxWidth: `${annotationPopoverSize.width}px`,
+        maxHeight: `${annotationPopoverSize.height}px`,
       }"
       role="group"
       :aria-label="kindLabel(selectedAnnotation.kind)"
@@ -2892,46 +2676,37 @@ onBeforeUnmount(() => {
       @mouseleave="scheduleHideAnnotationPopover"
       @click.stop
     >
-      <div class="flex items-center justify-between gap-3">
-        <div class="flex items-center gap-2 font-semibold">
-          <i
-            class="h-2 w-2 rounded-full"
-            :style="{
-              background: kinds.find((kind) => kind.value === selectedAnnotation?.kind)?.color,
-            }"
-          />
-          {{ kindLabel(selectedAnnotation.kind) }}
-        </div>
-        <div class="flex items-center gap-1">
-          <button
-            v-if="!annotationEditing"
-            class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100"
-            :title="translate('编辑说明', 'Edit note')"
-            :aria-label="translate('编辑说明', 'Edit note')"
-            @click.stop="startAnnotationEdit"
-          >
-            <Pencil :size="15" />
-          </button>
-          <button
-            class="rounded-md p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
-            :title="translate('删除标注', 'Delete annotation')"
-            :aria-label="translate('删除标注', 'Delete annotation')"
-            @click.stop="removeAnnotation(selectedAnnotation!)"
-          >
-            <Trash2 :size="15" />
-          </button>
-        </div>
+      <div class="flex shrink-0 justify-end gap-1 px-1 pt-1">
+        <button
+          v-if="!annotationEditing"
+          class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100"
+          :title="translate('编辑说明', 'Edit note')"
+          :aria-label="translate('编辑说明', 'Edit note')"
+          @click.stop="startAnnotationEdit"
+        >
+          <Pencil :size="15" />
+        </button>
+        <button
+          class="rounded-md p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+          :title="translate('删除标注', 'Delete annotation')"
+          :aria-label="translate('删除标注', 'Delete annotation')"
+          @click.stop="removeAnnotation(selectedAnnotation!)"
+        >
+          <Trash2 :size="15" />
+        </button>
       </div>
-      <p class="mt-3 rounded-md bg-slate-50 px-2.5 py-2 text-sm leading-5 [overflow-wrap:anywhere]">
-        {{ selectedAnnotation.quote }}
-      </p>
-      <p
-        v-if="!annotationEditing"
-        class="mt-2 max-h-32 overflow-x-hidden overflow-y-auto whitespace-pre-wrap text-sm leading-5 text-slate-600 [overflow-wrap:anywhere]"
-      >
-        {{ selectedAnnotation.note || translate('无说明', 'No note') }}
-      </p>
-      <div v-else class="mt-3">
+      <div v-if="!annotationEditing" class="min-h-0 overflow-auto">
+        <AnnotationMarkdown
+          :key="selectedAnnotation.id"
+          :markdown="selectedAnnotation.note || translate('无说明', 'No note')"
+          :document-path="selectedAnnotation.document"
+          :locale="locale"
+          :theme="theme"
+          @ready="nextTick(positionAnnotationPopover)"
+          @open-reference="openReference(selectedAnnotation!.document, $event)"
+        />
+      </div>
+      <div v-else class="min-h-0 overflow-auto p-3">
         <textarea
           id="vivin-annotation-note"
           v-model="annotationDraft"

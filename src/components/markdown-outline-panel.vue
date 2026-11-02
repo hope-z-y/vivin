@@ -38,7 +38,7 @@ onBeforeUnmount(() => {
   <nav
     :id="panelId"
     :aria-label="locale === 'en' ? 'Document outline' : '文档目录'"
-    class="absolute right-2 top-10 z-30 flex max-h-[65vh] w-72 max-w-[calc(100%-16px)] flex-col overflow-hidden rounded-xl bg-white shadow-xl"
+    class="flex h-full min-h-0 w-52 max-w-[35%] shrink-0 flex-col overflow-hidden border-r border-slate-200 bg-white"
     @click.stop
   >
     <div class="shrink-0 px-4 py-3 text-xs font-semibold text-slate-500">

@@ -183,29 +183,8 @@ body,
 .theme-dark button:not([class*='bg-blue']):hover {
   background-color: rgb(255 255 255 / 8%);
 }
-.theme-dark .rendered-editor .milkdown {
-  --crepe-color-background: #1b2635;
-  --crepe-color-on-background: #e8eef7;
-  --crepe-color-surface: #263448;
-  --crepe-color-surface-low: #202d3d;
-  --crepe-color-on-surface: #e8eef7;
-  --crepe-color-on-surface-variant: #afbed0;
-  --crepe-color-outline: #60758d;
-  --crepe-color-primary: #a8caff;
-  --crepe-color-secondary: #344760;
-  --crepe-color-on-secondary: #e8eef7;
-  --crepe-color-inverse: #e8eef7;
-  --crepe-color-on-inverse: #1b2635;
-  --crepe-color-inline-code: #ff9a98;
-  --crepe-color-error: #ff9a98;
-  --crepe-color-hover: #344760;
-  --crepe-color-selected: #415570;
-  --crepe-color-inline-area: #344760;
-}
 .theme-dark .source-editor .cm-editor,
-.theme-dark .source-editor .cm-gutters,
-.theme-dark .milkdown .cm-editor,
-.theme-dark .milkdown .cm-gutters {
+.theme-dark .source-editor .cm-gutters {
   color: #e8eef7;
   background: #1b2635;
 }
@@ -216,8 +195,7 @@ body,
 .theme-dark .source-editor .cm-selectionBackground {
   background: #385b87 !important;
 }
-.theme-dark .selection-annotation-toolbar,
-body:has(.theme-dark) .milkdown-toolbar {
+.theme-dark .selection-annotation-toolbar {
   background: #263448;
   color: #e8eef7;
 }

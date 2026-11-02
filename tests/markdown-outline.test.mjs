@@ -38,3 +38,11 @@ test('outline ignores heading syntax inside code blocks and blockquotes', () => 
     ['正文'],
   );
 });
+
+test('outline excludes frontmatter while retaining following heading offsets', () => {
+  const markdown = '---\ntitle: Metadata\n---\n\n# Real heading\n';
+  const headings = markdownHeadings(markdown);
+  assert.equal(headings.length, 1);
+  assert.equal(headings[0].text, 'Real heading');
+  assert.equal(headings[0].offset, markdown.indexOf('# Real heading'));
+});

@@ -22,10 +22,11 @@ function visibleText(node: unknown): string {
 
 export function markdownHeadings(markdown: string): MarkdownHeading[] {
   const headings: MarkdownHeading[] = [];
+  const frontmatterEnd = markdown.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/)?.[0].length ?? 0;
   for (const node of parser.parse(markdown).children) {
     if (node.type !== 'heading') continue;
     const offset = node.position?.start.offset;
-    if (offset === undefined) continue;
+    if (offset === undefined || offset < frontmatterEnd) continue;
     headings.push({ depth: node.depth, offset, text: visibleText(node).trim() });
   }
   return headings;

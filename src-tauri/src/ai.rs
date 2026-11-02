@@ -1,4 +1,3 @@
-use crate::history::{self, HistoryEntry};
 use crate::metadata::{Annotation, AnnotationKind, ProjectData, Term};
 use crate::project::{self, ProjectSession};
 use axum::{
@@ -18,7 +17,7 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
@@ -50,13 +49,11 @@ struct MoveArg {
     path: String,
     destination_directory: String,
     name: String,
-    rules_revision: String,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct DeleteEntryArg {
     path: String,
-    rules_revision: String,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -64,14 +61,12 @@ struct WriteArg {
     path: String,
     content: String,
     expected_revision: String,
-    rules_revision: String,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct CreateArg {
     directory: String,
     name: String,
-    rules_revision: String,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -81,7 +76,6 @@ struct AnnotationArg {
     quote: String,
     offset: usize,
     note: String,
-    rules_revision: String,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -89,26 +83,18 @@ struct TermArg {
     id: Option<String>,
     name: String,
     definition: String,
-    rules_revision: String,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct IdArg {
     id: String,
-    rules_revision: String,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct FlagArg {
     path: String,
     value: bool,
-    rules_revision: String,
 }
-#[derive(Deserialize, JsonSchema)]
-struct UndoArg {
-    id: String,
-}
-
 fn result<T: serde::Serialize>(value: Result<T, String>) -> Result<CallToolResult, McpError> {
     Ok(match value {
         Ok(value) => CallToolResult::success(vec![ContentBlock::text(
@@ -118,15 +104,6 @@ fn result<T: serde::Serialize>(value: Result<T, String>) -> Result<CallToolResul
     })
 }
 
-fn rules(root: &Path, expected: &str) -> Result<String, String> {
-    let content =
-        fs::read_to_string(project::checked_rules(root)?).map_err(|error| error.to_string())?;
-    if project::revision(&content) != expected {
-        return Err("项目规则已改变，请先重新读取项目规则再操作".to_string());
-    }
-    Ok(content)
-}
-
 fn root(app: &AppHandle) -> Result<PathBuf, String> {
     app.state::<ProjectSession>().root()
 }
@@ -134,7 +111,7 @@ fn root(app: &AppHandle) -> Result<PathBuf, String> {
 #[tool_router]
 impl VivinMcp {
     #[tool(
-        description = "Create and open a new vivin project in a local parent directory. The new project includes resources and AGENTS.md. Project creation is recorded for undo."
+        description = "Create and open a new vivin project in a local parent directory. The new project includes a resources directory."
     )]
     fn create_project(
         &self,
@@ -156,13 +133,10 @@ impl VivinMcp {
             }
             let root = parent.join(name_path);
             fs::create_dir(&root).map_err(|error| error.to_string())?;
-            let rules = "# 项目写作规则\n\n".to_string();
             let initial = (|| {
                 fs::create_dir(root.join("resources")).map_err(|error| error.to_string())?;
-                fs::write(root.join("AGENTS.md"), &rules).map_err(|error| error.to_string())?;
                 let data = ProjectData::load(&root)?;
                 data.save(&root)?;
-                history::append(&root, history::project_created(rules.clone(), data))?;
                 Ok::<(), String>(())
             })();
             if let Err(error) = initial {
@@ -174,9 +148,7 @@ impl VivinMcp {
                 "vivin://project-opened",
                 json!({ "name": arg.name, "path": root }),
             );
-            Ok(
-                json!({ "name": arg.name, "path": root, "rules": rules, "rulesRevision": project::revision(&rules) }),
-            )
+            Ok(json!({ "name": arg.name, "path": root }))
         })())
     }
 
@@ -185,7 +157,7 @@ impl VivinMcp {
     }
 
     #[tool(
-        description = "Open an existing local project folder in vivin and make it active. Returns the project path and AGENTS.md rules revision."
+        description = "Open an existing local project folder in vivin and make it active. Returns the project path."
     )]
     fn open_project(
         &self,
@@ -204,12 +176,6 @@ impl VivinMcp {
                 return Err("请选择项目目录".to_string());
             }
             ProjectData::load(&root)?;
-            let rules_path = root.join("AGENTS.md");
-            if !rules_path.exists() {
-                fs::write(&rules_path, "# 项目写作规则\n\n").map_err(|error| error.to_string())?;
-            }
-            let rules = fs::read_to_string(project::checked_rules(&root)?)
-                .map_err(|error| error.to_string())?;
             let name = root.file_name().map_or_else(
                 || root.to_string_lossy().into_owned(),
                 |name| name.to_string_lossy().into_owned(),
@@ -219,22 +185,15 @@ impl VivinMcp {
                 "vivin://project-opened",
                 json!({ "name": name, "path": root }),
             );
-            Ok(
-                json!({ "name": name, "path": root, "rules": rules, "rulesRevision": project::revision(&rules) }),
-            )
+            Ok(json!({ "name": name, "path": root }))
         })())
     }
 
-    #[tool(
-        description = "Get the active vivin project, its AGENTS.md writing rules and rule revision. Read this before every write; resolve conflicting instructions with the user."
-    )]
+    #[tool(description = "Get the active vivin project path.")]
     fn project_context(&self) -> Result<CallToolResult, McpError> {
         result((|| {
             let root = root(&self.app)?;
-            let rules = fs::read_to_string(project::checked_rules(&root)?)
-                .map_err(|error| error.to_string())?;
-            let revision = project::revision(&rules);
-            Ok(json!({ "path": root, "rules": rules, "rulesRevision": revision }))
+            Ok(json!({ "path": root }))
         })())
     }
 
@@ -277,7 +236,7 @@ impl VivinMcp {
     }
 
     #[tool(
-        description = "Replace a Markdown document using its exact expected revision. Requires the current AGENTS.md rules revision; writes are logged and locked files are rejected."
+        description = "Replace a Markdown document using its exact expected revision. Locked files are rejected."
     )]
     fn write_document(
         &self,
@@ -287,7 +246,6 @@ impl VivinMcp {
             let state = self.app.state::<ProjectSession>();
             let _guard = state.mutation_guard()?;
             let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
             let file = project::checked_document(&root, &arg.path)?;
             let before_disk = fs::read_to_string(&file).map_err(|error| error.to_string())?;
             let draft = state.draft(&arg.path)?;
@@ -313,18 +271,6 @@ impl VivinMcp {
                 arg.content.clone(),
                 expected_disk_revision,
             )?;
-            if let Err(error) = history::append(
-                &root,
-                history::document_entry(
-                    "write_document",
-                    &arg.path,
-                    Some(before.clone()),
-                    Some(arg.content.clone()),
-                ),
-            ) {
-                let _ = fs::write(&file, before_disk);
-                return Err(error);
-            }
             state.remove_draft(&arg.path)?;
             let _ = self.app.emit(
                 "vivin://document-written",
@@ -335,7 +281,7 @@ impl VivinMcp {
     }
 
     #[tool(
-        description = "Create a Markdown document in the active project. The directory is project-relative or empty for the root. Requires the current rules revision."
+        description = "Create a Markdown document in the active project. The directory is project-relative or empty for the root."
     )]
     fn create_document(
         &self,
@@ -345,7 +291,6 @@ impl VivinMcp {
             let state = self.app.state::<ProjectSession>();
             let _guard = state.mutation_guard()?;
             let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
             let parent = if arg.directory.is_empty() {
                 root.clone()
             } else {
@@ -374,13 +319,6 @@ impl VivinMcp {
                 .create_new(true)
                 .open(&file)
                 .map_err(|error| error.to_string())?;
-            if let Err(error) = history::append(
-                &root,
-                history::document_entry("create_document", &path, None, Some(String::new())),
-            ) {
-                let _ = fs::remove_file(&file);
-                return Err(error);
-            }
             let document = project::Document {
                 path,
                 content: String::new(),
@@ -391,9 +329,7 @@ impl VivinMcp {
         })())
     }
 
-    #[tool(
-        description = "Create a directory in the active project. Requires current AGENTS.md rules revision."
-    )]
+    #[tool(description = "Create a directory in the active project.")]
     fn create_directory(
         &self,
         Parameters(arg): Parameters<CreateArg>,
@@ -402,7 +338,6 @@ impl VivinMcp {
             let state = self.app.state::<ProjectSession>();
             let _guard = state.mutation_guard()?;
             let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
             let parent = if arg.directory.is_empty() {
                 root.clone()
             } else {
@@ -423,27 +358,19 @@ impl VivinMcp {
             ProjectData::load(&root)?.require_unlocked(&path)?;
             let absolute = parent.join(name);
             fs::create_dir(&absolute).map_err(|error| error.to_string())?;
-            if let Err(error) = history::append(
-                &root,
-                history::directory_entry("create_directory", &path, None, Some(path.clone())),
-            ) {
-                let _ = fs::remove_dir(&absolute);
-                return Err(error);
-            }
             let _ = self.app.emit("vivin://project-changed", ());
             Ok(json!({ "path": path }))
         })())
     }
 
     #[tool(
-        description = "Move or rename a Markdown document or directory within the active project. Requires current project rules revision. The operation is recorded for undo."
+        description = "Move or rename a Markdown document or directory within the active project."
     )]
     fn move_entry(&self, Parameters(arg): Parameters<MoveArg>) -> Result<CallToolResult, McpError> {
         result((|| {
             let state = self.app.state::<ProjectSession>();
             let _guard = state.mutation_guard()?;
             let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
             let source = project::checked_member(&root, &arg.path)?;
             if state.has_draft_under(&arg.path)? {
                 return Err("目标包含未保存草稿，请先保存".to_string());
@@ -479,27 +406,10 @@ impl VivinMcp {
             {
                 return Err("目录内有独立锁定内容，请先解锁".to_string());
             }
-            let digest = history::tree_digest(&source)?;
-            let before = data.clone();
             data.remap_paths(&arg.path, &new_path);
             fs::rename(&source, &target).map_err(|error| error.to_string())?;
             if let Err(error) = data.save(&root) {
                 let _ = fs::rename(&target, &source);
-                return Err(error);
-            }
-            if let Err(error) = history::append(
-                &root,
-                history::moved_entry(
-                    "move_entry",
-                    &arg.path,
-                    &new_path,
-                    before.clone(),
-                    data,
-                    digest,
-                ),
-            ) {
-                let _ = fs::rename(&target, &source);
-                let _ = before.save(&root);
                 return Err(error);
             }
             let _ = self.app.emit(
@@ -511,50 +421,17 @@ impl VivinMcp {
         })())
     }
 
-    #[tool(
-        description = "Delete a Markdown document or directory and preserve a project-local backup for undo. Requires current project rules revision."
-    )]
+    #[tool(description = "Delete a Markdown document or directory within the active project.")]
     fn delete_entry(
         &self,
         Parameters(arg): Parameters<DeleteEntryArg>,
     ) -> Result<CallToolResult, McpError> {
         result((|| {
             let state = self.app.state::<ProjectSession>();
-            let _guard = state.mutation_guard()?;
-            let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
-            let source = project::checked_member(&root, &arg.path)?;
             if state.has_draft_under(&arg.path)? {
                 return Err("目标包含未保存草稿，请先保存".to_string());
             }
-            let mut data = ProjectData::load(&root)?;
-            data.require_unlocked(&arg.path)?;
-            if data
-                .locked
-                .iter()
-                .any(|locked| locked.starts_with(&format!("{}/", arg.path)))
-            {
-                return Err("目录内有独立锁定内容，请先解锁".to_string());
-            }
-            let digest = history::tree_digest(&source)?;
-            let before = data.clone();
-            data.remove_paths(&arg.path);
-            let backup_dir = project::safe_project_directory(&root, ".vivin/ai-trash", true)?;
-            let backup_id = Uuid::new_v4().to_string();
-            let backup = backup_dir.join(&backup_id);
-            fs::rename(&source, &backup).map_err(|error| error.to_string())?;
-            if let Err(error) = data.save(&root) {
-                let _ = fs::rename(&backup, &source);
-                return Err(error);
-            }
-            if let Err(error) = history::append(
-                &root,
-                history::deleted_entry(&arg.path, &backup_id, before.clone(), data, digest),
-            ) {
-                let _ = fs::rename(&backup, &source);
-                let _ = before.save(&root);
-                return Err(error);
-            }
+            project::delete_entry(arg.path.clone(), state)?;
             let _ = self
                 .app
                 .emit("vivin://entry-deleted", json!({ "path": arg.path }));
@@ -586,7 +463,7 @@ impl VivinMcp {
     }
 
     #[tool(
-        description = "Add a todo, comment, question or error annotation to selected Markdown source text. The note may be empty. Requires current project rules revision."
+        description = "Add a todo, comment, question or error annotation to selected Markdown source text. The note may be empty."
     )]
     fn add_annotation(
         &self,
@@ -596,7 +473,6 @@ impl VivinMcp {
             let state = self.app.state::<ProjectSession>();
             let _guard = state.mutation_guard()?;
             let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
             let file = project::checked_document(&root, &arg.document)?;
             let disk = fs::read_to_string(file).map_err(|error| error.to_string())?;
             let content = if let Some(draft) = state.draft(&arg.document)? {
@@ -625,7 +501,6 @@ impl VivinMcp {
             };
             let mut data = ProjectData::load(&root)?;
             data.require_unlocked(&arg.document)?;
-            let before = data.clone();
             let annotation = Annotation {
                 id: Uuid::new_v4().to_string(),
                 document: arg.document.clone(),
@@ -645,21 +520,12 @@ impl VivinMcp {
             };
             data.annotations.push(annotation.clone());
             data.save(&root)?;
-            if let Err(error) = history::append(
-                &root,
-                history::metadata_entry("add_annotation", &arg.document, before.clone(), data),
-            ) {
-                let _ = before.save(&root);
-                return Err(error);
-            }
             let _ = self.app.emit("vivin://project-changed", ());
             Ok(annotation)
         })())
     }
 
-    #[tool(
-        description = "Delete an annotation by ID. Requires the current project rules revision."
-    )]
+    #[tool(description = "Delete an annotation by ID.")]
     fn delete_annotation(
         &self,
         Parameters(arg): Parameters<IdArg>,
@@ -668,33 +534,21 @@ impl VivinMcp {
             let state = self.app.state::<ProjectSession>();
             let _guard = state.mutation_guard()?;
             let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
             let mut data = ProjectData::load(&root)?;
-            let before = data.clone();
             let annotation = data
                 .annotations
                 .iter()
                 .find(|item| item.id == arg.id)
                 .ok_or("标注不存在")?;
             data.require_unlocked(&annotation.document)?;
-            let target = annotation.document.clone();
             data.annotations.retain(|item| item.id != arg.id);
             data.save(&root)?;
-            if let Err(error) = history::append(
-                &root,
-                history::metadata_entry("delete_annotation", &target, before.clone(), data),
-            ) {
-                let _ = before.save(&root);
-                return Err(error);
-            }
             let _ = self.app.emit("vivin://project-changed", ());
             Ok(json!({ "deleted": arg.id }))
         })())
     }
 
-    #[tool(
-        description = "Create or update a shared project term. Requires current project rules revision."
-    )]
+    #[tool(description = "Create or update a shared project term.")]
     fn upsert_term(
         &self,
         Parameters(arg): Parameters<TermArg>,
@@ -703,9 +557,7 @@ impl VivinMcp {
             let state = self.app.state::<ProjectSession>();
             let _guard = state.mutation_guard()?;
             let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
             let mut data = ProjectData::load(&root)?;
-            let before = data.clone();
             let name = arg.name.trim();
             if name.is_empty() {
                 return Err("术语名称不能为空".to_string());
@@ -728,34 +580,18 @@ impl VivinMcp {
                 data.terms.push(term.clone());
             }
             data.save(&root)?;
-            if let Err(error) = history::append(
-                &root,
-                history::metadata_entry(
-                    "upsert_term",
-                    &format!("term:{}", term.id),
-                    before.clone(),
-                    data,
-                ),
-            ) {
-                let _ = before.save(&root);
-                return Err(error);
-            }
             let _ = self.app.emit("vivin://project-changed", ());
             Ok(term)
         })())
     }
 
-    #[tool(
-        description = "Delete a shared project term by ID. Requires current project rules revision."
-    )]
+    #[tool(description = "Delete a shared project term by ID.")]
     fn delete_term(&self, Parameters(arg): Parameters<IdArg>) -> Result<CallToolResult, McpError> {
         result((|| {
             let state = self.app.state::<ProjectSession>();
             let _guard = state.mutation_guard()?;
             let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
             let mut data = ProjectData::load(&root)?;
-            let before = data.clone();
             if !data.terms.iter().any(|term| term.id == arg.id) {
                 return Err("术语不存在".to_string());
             }
@@ -763,66 +599,41 @@ impl VivinMcp {
             data.term_exceptions
                 .retain(|exception| exception.term_id != arg.id);
             data.save(&root)?;
-            if let Err(error) = history::append(
-                &root,
-                history::metadata_entry(
-                    "delete_term",
-                    &format!("term:{}", arg.id),
-                    before.clone(),
-                    data,
-                ),
-            ) {
-                let _ = before.save(&root);
-                return Err(error);
-            }
             let _ = self.app.emit("vivin://project-changed", ());
             Ok(json!({ "deleted": arg.id }))
         })())
     }
 
-    #[tool(
-        description = "Pin or unpin a Markdown document. Requires current project rules revision."
-    )]
+    #[tool(description = "Pin or unpin a Markdown document.")]
     fn set_pinned(&self, Parameters(arg): Parameters<FlagArg>) -> Result<CallToolResult, McpError> {
         result((|| {
             let state = self.app.state::<ProjectSession>();
             let _guard = state.mutation_guard()?;
             let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
             project::checked_document(&root, &arg.path)?;
             let mut data = ProjectData::load(&root)?;
             data.require_unlocked(&arg.path)?;
-            let before = data.clone();
             if arg.value {
                 data.pinned.insert(arg.path.clone());
             } else {
                 data.pinned.remove(&arg.path);
             }
             data.save(&root)?;
-            if let Err(error) = history::append(
-                &root,
-                history::metadata_entry("set_pinned", &arg.path, before.clone(), data),
-            ) {
-                let _ = before.save(&root);
-                return Err(error);
-            }
             let _ = self.app.emit("vivin://project-changed", ());
             Ok(json!({ "path": arg.path, "pinned": arg.value }))
         })())
     }
 
     #[tool(
-        description = "Lock or unlock a document or directory. An inherited lock cannot be removed on a child. Requires current project rules revision."
+        description = "Lock or unlock a document or directory. An inherited lock cannot be removed on a child."
     )]
     fn set_locked(&self, Parameters(arg): Parameters<FlagArg>) -> Result<CallToolResult, McpError> {
         result((|| {
             let state = self.app.state::<ProjectSession>();
             let _guard = state.mutation_guard()?;
             let root = state.root()?;
-            rules(&root, &arg.rules_revision)?;
             project::checked_member(&root, &arg.path)?;
             let mut data = ProjectData::load(&root)?;
-            let before = data.clone();
             if !arg.value
                 && data
                     .lock_source(&arg.path)
@@ -836,69 +647,8 @@ impl VivinMcp {
                 data.locked.remove(&arg.path);
             }
             data.save(&root)?;
-            if let Err(error) = history::append(
-                &root,
-                history::metadata_entry("set_locked", &arg.path, before.clone(), data),
-            ) {
-                let _ = before.save(&root);
-                return Err(error);
-            }
             let _ = self.app.emit("vivin://project-changed", ());
             Ok(json!({ "path": arg.path, "locked": arg.value }))
-        })())
-    }
-
-    #[tool(description = "List AI changes to the current project, newest first.")]
-    fn list_history(&self) -> Result<CallToolResult, McpError> {
-        result((|| {
-            let mut entries = history::load(&root(&self.app)?)?;
-            entries.reverse();
-            Ok(entries)
-        })())
-    }
-
-    #[tool(
-        description = "Undo one AI change by its history ID. Refuses to overwrite later changes or bypass locks."
-    )]
-    fn undo_change(
-        &self,
-        Parameters(arg): Parameters<UndoArg>,
-    ) -> Result<CallToolResult, McpError> {
-        result((|| {
-            let state = self.app.state::<ProjectSession>();
-            let _guard = state.mutation_guard()?;
-            let root = state.root()?;
-            let original = history::load(&root)?
-                .into_iter()
-                .find(|entry| entry.id == arg.id)
-                .ok_or("修改记录不存在")?;
-            if original.created_project && state.has_dirty_draft()? {
-                return Err("项目有未保存草稿，无法撤销创建".to_string());
-            }
-            if state.has_draft_under(&original.target)?
-                || original
-                    .after_path
-                    .as_deref()
-                    .is_some_and(|path| state.has_draft_under(path).unwrap_or(true))
-            {
-                return Err("目标包含未保存草稿，请先保存或处理".to_string());
-            }
-            let entry = history::undo(&root, &arg.id)?;
-            if entry.operation == "undo_create_project" {
-                state.clear_root()?;
-                let _ = self.app.emit("vivin://project-closed", ());
-                return Ok(entry);
-            }
-            let _ = self.app.emit("vivin://project-changed", ());
-            if let (Some(from), Some(to)) = (&entry.before_path, &entry.after_path) {
-                let _ = self
-                    .app
-                    .emit("vivin://entry-moved", json!({ "from": from, "to": to }));
-            }
-            if entry.before_content.is_some() || entry.after_content.is_some() {
-                let _ = self.app.emit("vivin://document-changed", &entry.target);
-            }
-            Ok(entry)
         })())
     }
 }
@@ -908,7 +658,7 @@ impl ServerHandler for VivinMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
-            .with_instructions("The active vivin project is selected in the desktop app. Call project_context before writing; follow its AGENTS.md rules and resolve contradictions with the user. Every write requires rulesRevision and follows project lock and version checks.".to_string())
+            .with_instructions("The active vivin project is selected in the desktop app. All paths are relative to that project. Writes follow project lock and document version checks.".to_string())
     }
 }
 
@@ -1005,61 +755,4 @@ pub fn start(app: AppHandle) -> Result<(), String> {
         }
     });
     Ok(())
-}
-
-#[tauri::command]
-pub fn bridge_info(app: AppHandle) -> Result<serde_json::Value, String> {
-    let directory = app
-        .path()
-        .app_config_dir()
-        .map_err(|error| error.to_string())?;
-    Ok(
-        json!({ "url": format!("http://127.0.0.1:{PORT}/mcp"), "configPath": directory.join("bridge.json") }),
-    )
-}
-
-#[tauri::command]
-pub fn list_history(state: tauri::State<'_, ProjectSession>) -> Result<Vec<HistoryEntry>, String> {
-    let mut entries = history::load(&state.root()?)?;
-    entries.reverse();
-    Ok(entries)
-}
-
-#[tauri::command]
-pub fn undo_change(
-    id: String,
-    app: AppHandle,
-    state: tauri::State<'_, ProjectSession>,
-) -> Result<HistoryEntry, String> {
-    let _guard = state.mutation_guard()?;
-    let root = state.root()?;
-    let original = history::load(&root)?
-        .into_iter()
-        .find(|entry| entry.id == id)
-        .ok_or("修改记录不存在")?;
-    if original.created_project && state.has_dirty_draft()? {
-        return Err("项目有未保存草稿，无法撤销创建".to_string());
-    }
-    if state.has_draft_under(&original.target)?
-        || original
-            .after_path
-            .as_deref()
-            .is_some_and(|path| state.has_draft_under(path).unwrap_or(true))
-    {
-        return Err("目标包含未保存草稿，请先保存或处理".to_string());
-    }
-    let entry = history::undo(&root, &id)?;
-    if entry.operation == "undo_create_project" {
-        state.clear_root()?;
-        let _ = app.emit("vivin://project-closed", ());
-        return Ok(entry);
-    }
-    let _ = app.emit("vivin://project-changed", ());
-    if let (Some(from), Some(to)) = (&entry.before_path, &entry.after_path) {
-        let _ = app.emit("vivin://entry-moved", json!({ "from": from, "to": to }));
-    }
-    if entry.before_content.is_some() || entry.after_content.is_some() {
-        let _ = app.emit("vivin://document-changed", &entry.target);
-    }
-    Ok(entry)
 }

@@ -1,23 +1,26 @@
 <script setup lang="ts">
 import { Crepe, CrepeFeature } from '@milkdown/crepe';
-import { editorViewCtx } from '@milkdown/kit/core';
+import { editorViewCtx, parserCtx, schemaCtx, serializerCtx } from '@milkdown/kit/core';
 import type { Ctx } from '@milkdown/kit/ctx';
 import { uploadConfig } from '@milkdown/kit/plugin/upload';
 import { Plugin, PluginKey, type EditorState } from '@milkdown/kit/prose/state';
 import { Decoration, DecorationSet } from '@milkdown/kit/prose/view';
-import { $prose, replaceAll } from '@milkdown/kit/utils';
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { $prose } from '@milkdown/kit/utils';
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { preserveSource, sourceBlock } from '../features/editor/preserve-source';
 import type { AnnotationMark } from '../lib/annotation-anchor';
 import { markdownHeadings } from '../lib/markdown-outline';
 import type { AnnotationKind } from '../lib/project-api';
 import { equivalentMarkdown } from '../lib/markdown-roundtrip';
 import { createTextMatcher } from '../lib/text-matcher';
-import { getCachedMermaidPreview, renderMermaidPreview } from '../lib/mermaid-preview';
+import {
+  getCachedMermaidPreview,
+  renderMermaidPreview,
+  renderMermaidSvg,
+} from '../lib/mermaid-preview';
 import { importImage, readProjectImage } from '../lib/project-api';
 import LoadingState from './loading-state.vue';
 import DiagramViewer from './diagram-viewer.vue';
-import '@milkdown/crepe/theme/common/style.css';
-import '@milkdown/crepe/theme/frame.css';
 
 const props = defineProps<{
   modelValue: string;
@@ -26,6 +29,7 @@ const props = defineProps<{
   annotations?: AnnotationMark[];
   terms?: { id: string; offset: number; quote: string }[];
   locale?: 'zh' | 'en';
+  theme?: 'light' | 'dark';
   embedded?: boolean;
   deferMermaid?: boolean;
 }>();
@@ -46,6 +50,8 @@ let crepe: Crepe | undefined;
 let applyingExternalChange = true;
 let editorMarkdown = '';
 let disposed = false;
+let pendingChanges = false;
+let changeTimer: ReturnType<typeof setTimeout> | undefined;
 let resolveReady: () => void = () => {};
 const ready = new Promise<void>((resolve) => {
   resolveReady = resolve;
@@ -56,6 +62,20 @@ const mermaidRequests = new Map<
   { content: string; applyPreview: (value: null | string | HTMLElement) => void }
 >();
 let nextMermaidRequestId = 0;
+const activeMermaidPreviews = new Map<(value: null | string | HTMLElement) => void, string>();
+watch(
+  () => props.theme,
+  () => {
+    for (const [apply, content] of activeMermaidPreviews) {
+      void renderMermaidSvg(content, props.theme === 'dark')
+        .then((svg) => {
+          if (!disposed) apply(svg);
+        })
+        .catch(() => {});
+    }
+  },
+  { flush: 'post' },
+);
 
 function mermaidPreview(
   language: string,
@@ -63,6 +83,7 @@ function mermaidPreview(
   applyPreview: (value: null | string | HTMLElement) => void,
 ): null | string | void {
   if (language.toLowerCase() !== 'mermaid' || !content.trim()) return null;
+  activeMermaidPreviews.set(applyPreview, content);
   if (!props.deferMermaid && props.modelValue.length < 100_000)
     return renderMermaidPreview(language, content, applyPreview);
   const cached = getCachedMermaidPreview(content);
@@ -135,19 +156,60 @@ async function revealAnnotation(id: string): Promise<boolean> {
 
 async function revealHeading(offset: number): Promise<boolean> {
   await ready;
-  const index = markdownHeadings(props.modelValue).findIndex(
-    (heading) => heading.offset === offset,
-  );
+  const rawRanges: { start: number; end: number; element: HTMLElement }[] = [];
+  let from = 0;
+  for (const element of container.value?.querySelectorAll<HTMLElement>('[data-vivin-source]') ??
+    []) {
+    const text = element.textContent ?? '';
+    const start = props.modelValue.indexOf(text, from);
+    if (start < 0) continue;
+    from = start + text.length;
+    rawRanges.push({ start, end: from, element });
+  }
+  const raw = rawRanges.find((range) => offset >= range.start && offset < range.end);
+  if (raw) {
+    raw.element.scrollIntoView({ block: 'center', inline: 'nearest' });
+    return true;
+  }
+  const index = markdownHeadings(props.modelValue)
+    .filter(
+      (heading) =>
+        !rawRanges.some((range) => heading.offset >= range.start && heading.offset < range.end),
+    )
+    .findIndex((heading) => heading.offset === offset);
   if (index < 0) return false;
   const node = container.value?.querySelectorAll<HTMLElement>(
-    '.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror h5, .ProseMirror h6',
+    '.ProseMirror > h1, .ProseMirror > h2, .ProseMirror > h3, .ProseMirror > h4, .ProseMirror > h5, .ProseMirror > h6',
   )[index];
   if (!node) return false;
   node.scrollIntoView({ block: 'center', inline: 'nearest' });
   return true;
 }
 
-defineExpose({ revealAnnotation, revealHeading });
+function flush() {
+  if (changeTimer) clearTimeout(changeTimer);
+  changeTimer = undefined;
+  if (!pendingChanges || !crepe || applyingExternalChange || disposed) return;
+  pendingChanges = false;
+  const markdown = crepe.getMarkdown();
+  editorMarkdown = markdown;
+  if (markdown !== props.modelValue) emit('update:modelValue', markdown);
+}
+const documentSyncPlugin = $prose(
+  () =>
+    new Plugin({
+      view: () => ({
+        update(view, previous) {
+          if (applyingExternalChange || previous.doc.eq(view.state.doc)) return;
+          pendingChanges = true;
+          if (changeTimer) clearTimeout(changeTimer);
+          changeTimer = setTimeout(flush, 120);
+        },
+      }),
+    }),
+);
+
+defineExpose({ revealAnnotation, revealHeading, flush });
 
 async function proxyImage(url: string): Promise<string> {
   if (/^(https?:|data:|blob:)/i.test(url)) return url;
@@ -195,6 +257,7 @@ const annotationIcons: Record<AnnotationKind, string> = {
 };
 const markRefreshKey = new PluginKey<DecorationSet>('vivin-marks');
 function requestAnnotation(kind: AnnotationKind, context: Ctx) {
+  flush();
   const view = context.get(editorViewCtx);
   const { from, to } = view.state.selection;
   const quote = view.state.doc.textBetween(from, to, '', '');
@@ -202,7 +265,7 @@ function requestAnnotation(kind: AnnotationKind, context: Ctx) {
   const visible = view.state.doc.textBetween(0, view.state.doc.content.size, '', '');
   const prefix = view.state.doc.textBetween(0, from, '', '');
   const rank = occurrences(prefix, quote).length;
-  const raw = occurrences(props.modelValue, quote);
+  const raw = occurrences(editorMarkdown || props.modelValue, quote);
   const matches = occurrences(visible, quote);
   const offset = raw.length === matches.length ? raw[rank] : raw.length === 1 ? raw[0] : undefined;
   if (offset === undefined) {
@@ -468,16 +531,11 @@ onMounted(async () => {
         },
       }));
     });
-    instance.editor.use(annotationPlugin);
-    instance.on((listener) => {
-      listener.markdownUpdated((_context, markdown) => {
-        const previous = editorMarkdown;
-        editorMarkdown = markdown;
-        if (editorFailed.value) return;
-        if (!applyingExternalChange && markdown !== previous && markdown !== props.modelValue)
-          emit('update:modelValue', markdown);
-      });
-    });
+    instance.editor
+      .use(preserveSource)
+      .use(sourceBlock)
+      .use(annotationPlugin)
+      .use(documentSyncPlugin);
     await instance.create();
     if (disposed) {
       await instance.destroy();
@@ -486,9 +544,15 @@ onMounted(async () => {
     const roundtrip = instance.getMarkdown();
     editorMarkdown = roundtrip;
     if (!equivalentMarkdown(roundtrip, props.modelValue)) {
-      await instance.destroy();
-      emit('incompatible');
-      return;
+      instance.editor.action((context) => {
+        const view = context.get(editorViewCtx);
+        const schema = context.get(schemaCtx);
+        const raw = sourceBlock
+          .type(context)
+          .create(null, props.modelValue ? schema.text(props.modelValue) : undefined);
+        view.dispatch(view.state.tr.replaceWith(0, view.state.doc.content.size, raw));
+      });
+      editorMarkdown = instance.getMarkdown();
     }
     instance.setReadonly(Boolean(props.readonly));
     crepe = instance;
@@ -509,13 +573,39 @@ watch(
   () => props.modelValue,
   (value) => {
     if (!crepe || editorMarkdown === value) return;
+    const scrollTop = container.value?.scrollTop ?? 0;
+    if (changeTimer) clearTimeout(changeTimer);
+    pendingChanges = false;
     applyingExternalChange = true;
-    crepe.editor.action(replaceAll(value));
+    crepe.editor.action((context) => {
+      const view = context.get(editorViewCtx);
+      let doc = context.get(parserCtx)(value);
+      if (!doc) return;
+      if (!equivalentMarkdown(context.get(serializerCtx)(doc), value)) {
+        const schema = context.get(schemaCtx);
+        const raw = sourceBlock.type(context).create(null, value ? schema.text(value) : undefined);
+        doc = schema.topNodeType.create(null, raw);
+      }
+      const start = view.state.doc.content.findDiffStart(doc.content);
+      if (start === null) return;
+      const end = view.state.doc.content.findDiffEnd(doc.content);
+      let endBefore = end?.a ?? start;
+      let endAfter = end?.b ?? start;
+      const overlap = start - Math.min(endBefore, endAfter);
+      if (overlap > 0) {
+        endBefore += overlap;
+        endAfter += overlap;
+      }
+      view.dispatch(
+        view.state.tr
+          .replace(start, endBefore, doc.slice(start, endAfter))
+          .setMeta('addToHistory', false),
+      );
+    });
     editorMarkdown = crepe.getMarkdown();
-    if (!equivalentMarkdown(editorMarkdown, value)) {
-      editorFailed.value = true;
-      emit('incompatible');
-    }
+    void nextTick(() => {
+      if (container.value) container.value.scrollTop = scrollTop;
+    });
     applyingExternalChange = false;
   },
 );
@@ -548,8 +638,10 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  if (changeTimer) clearTimeout(changeTimer);
   disposed = true;
   mermaidRequests.clear();
+  activeMermaidPreviews.clear();
   resolveReady();
   void crepe?.destroy();
 });
@@ -566,6 +658,7 @@ onBeforeUnmount(() => {
         !embedded && modelValue.length >= 100_000 ? 'rendered-editor-large' : '',
       ]"
       @click.capture="handleRenderedClick"
+      @focusout="flush"
       @scroll.passive="keepHorizontalPosition"
     />
     <LoadingState
@@ -584,101 +677,25 @@ onBeforeUnmount(() => {
 
 <style>
 .rendered-editor .milkdown {
-  margin: 0 auto;
-  max-width: 100%;
   min-height: 100%;
-  box-shadow: none;
+  min-width: 0;
 }
-
-.rendered-editor-embedded .milkdown {
-  min-height: 0;
-}
-
-.rendered-editor .milkdown .ProseMirror {
-  box-sizing: border-box;
-  width: 100%;
-  max-width: 860px;
-  margin: 0 auto;
-  padding: 32px clamp(24px, 5vw, 64px) 100px;
-  overflow-x: clip;
-}
-
-.rendered-editor-embedded .milkdown .ProseMirror {
-  padding-block: 1px;
-}
-
-.rendered-editor-large .milkdown .ProseMirror > .milkdown-table-block {
+.rendered-editor-large .milkdown .ProseMirror > * {
   content-visibility: auto;
-  contain-intrinsic-size: auto 360px;
+  contain-intrinsic-size: auto 100px;
 }
-
-.rendered-editor-large .milkdown .ProseMirror > .milkdown-code-block {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 220px;
-}
-
-.rendered-editor .milkdown .milkdown-code-block .preview {
-  max-width: 100%;
-  overflow-x: auto;
-}
-
 .rendered-editor .milkdown .milkdown-code-block .preview svg {
-  display: block;
-  margin: 0 auto;
   max-width: 100%;
   height: auto;
   cursor: zoom-in;
 }
-
-.rendered-editor .milkdown .vivin-mermaid-load {
+.vivin-mermaid-load {
   display: block;
-  width: 100%;
-  min-height: 72px;
-  border: 1px dashed #a9b8cc;
-  border-radius: 6px;
-  background: #f8fafc;
-  color: #2563eb;
+  padding: 16px;
   cursor: pointer;
 }
-
-.rendered-editor .milkdown .milkdown-code-block .preview:has(svg[id^='vivin-mermaid-']) {
-  padding: 20px 8px;
-  border-radius: 10px;
-  background: var(--document-background, #fff);
-}
-
-.rendered-editor .milkdown .vivin-mermaid-error {
+.vivin-mermaid-error {
   padding: 12px;
-  color: #b42318;
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.rendered-editor .milkdown .milkdown-table-block {
-  max-width: 100%;
-  min-width: 0;
-}
-
-.rendered-editor .milkdown .milkdown-table-block .table-wrapper {
-  display: block;
-  max-width: 100%;
-  overflow-x: auto;
-  overflow-y: hidden;
-  overscroll-behavior-x: contain;
-}
-
-.rendered-editor .milkdown .milkdown-table-block table {
-  width: max-content;
-  min-width: 100%;
-  table-layout: auto;
-}
-
-.rendered-editor .milkdown .milkdown-table-block th,
-.rendered-editor .milkdown .milkdown-table-block td {
-  min-width: 170px;
-  max-width: 360px;
-  white-space: normal;
-  overflow-wrap: break-word;
-  vertical-align: top;
 }
 </style>

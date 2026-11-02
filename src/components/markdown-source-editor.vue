@@ -121,12 +121,7 @@ onMounted(() => {
             emit('update:modelValue', update.state.doc.toString());
           }
           const selection = update.state.selection.main;
-          if (
-            props.readonly ||
-            props.documentPath === 'AGENTS.md' ||
-            selection.empty ||
-            !container.value
-          ) {
+          if (props.readonly || selection.empty || !container.value) {
             selectionToolbar.value = null;
             return;
           }

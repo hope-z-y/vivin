@@ -55,12 +55,16 @@ onBeforeUnmount(() => {
       <button
         v-for="heading in headings"
         :key="heading.offset"
-        class="block w-full truncate rounded-lg py-1.5 pr-3 text-left text-sm text-slate-700 hover:bg-slate-100 focus-visible:bg-slate-100"
+        class="outline-heading flex w-full items-baseline gap-2 rounded-lg py-2 pr-3 text-left text-sm text-slate-700 hover:bg-slate-100 focus-visible:bg-slate-100"
+        :class="heading.depth <= 2 ? 'font-semibold' : ''"
         :style="{ paddingLeft: `${12 + (heading.depth - 1) * 14}px` }"
         :title="heading.text"
         @click="emit('select', heading.offset)"
       >
-        {{ heading.text || (locale === 'en' ? 'Untitled heading' : '无标题') }}
+        <span class="shrink-0 text-[10px] font-medium text-slate-400">H{{ heading.depth }}</span>
+        <span class="min-w-0 truncate">{{
+          heading.text || (locale === 'en' ? 'Untitled heading' : '无标题')
+        }}</span>
       </button>
     </div>
   </nav>

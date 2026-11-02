@@ -2,8 +2,10 @@
 import { markdown } from '@codemirror/lang-markdown';
 import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
 import { Decoration, EditorView, keymap, type DecorationSet } from '@codemirror/view';
+import { basicSetup } from 'codemirror';
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { AnnotationMark } from '../lib/annotation-anchor';
+import { minimalDocumentChange } from '../lib/document-change';
 import { importImage, type AnnotationKind } from '../lib/project-api';
 
 const props = defineProps<{
@@ -83,6 +85,7 @@ onMounted(() => {
     state: EditorState.create({
       doc: props.modelValue,
       extensions: [
+        basicSetup,
         markdown(),
         EditorView.lineWrapping,
         readonlyCompartment.of(EditorView.editable.of(!props.readonly)),
@@ -147,7 +150,7 @@ watch(
   (value) => {
     if (!editor || editor.state.doc.toString() === value) return;
     applyingExternalChange = true;
-    editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: value } });
+    editor.dispatch({ changes: minimalDocumentChange(editor.state.doc.toString(), value) });
     applyingExternalChange = false;
   },
 );
@@ -261,9 +264,25 @@ defineExpose({ reveal, selectedText });
 }
 
 .source-editor .cm-scroller {
-  padding: 32px 48px;
+  padding: 28px clamp(12px, 3vw, 40px) 80px 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   line-height: 1.7;
+}
+
+.source-editor .cm-content {
+  padding: 4px 0;
+}
+.source-editor .cm-gutters {
+  border: 0;
+  background: transparent;
+  color: #94a3b8;
+}
+.source-editor .cm-activeLine,
+.source-editor .cm-activeLineGutter {
+  background: #f1f5fb;
+}
+.source-editor .cm-line {
+  padding-inline: 12px;
 }
 
 .source-editor .cm-focused {

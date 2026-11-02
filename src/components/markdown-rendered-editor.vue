@@ -15,6 +15,7 @@ import { createTextMatcher } from '../lib/text-matcher';
 import { getCachedMermaidPreview, renderMermaidPreview } from '../lib/mermaid-preview';
 import { importImage, readProjectImage } from '../lib/project-api';
 import LoadingState from './loading-state.vue';
+import DiagramViewer from './diagram-viewer.vue';
 import '@milkdown/crepe/theme/common/style.css';
 import '@milkdown/crepe/theme/frame.css';
 
@@ -39,10 +40,11 @@ const emit = defineEmits<{
 
 const container = ref<HTMLDivElement>();
 const editorReady = ref(false);
+const expandedDiagram = ref('');
+const editorFailed = ref(false);
 let crepe: Crepe | undefined;
 let applyingExternalChange = true;
 let editorMarkdown = '';
-let externalMarkdown: string | undefined = props.modelValue;
 let disposed = false;
 let resolveReady: () => void = () => {};
 const ready = new Promise<void>((resolve) => {
@@ -105,6 +107,15 @@ function openLink(event: MouseEvent) {
 
 function handleRenderedClick(event: MouseEvent) {
   handleMermaidClick(event);
+  const target =
+    event.target instanceof Element
+      ? event.target.closest<SVGSVGElement>('svg[id^="vivin-mermaid-"]')
+      : null;
+  if (target) {
+    event.preventDefault();
+    event.stopPropagation();
+    expandedDiagram.value = target.outerHTML;
+  }
   if (!event.defaultPrevented) openLink(event);
 }
 
@@ -349,6 +360,7 @@ const annotationPlugin = $prose(() => {
 });
 
 onMounted(async () => {
+  let initializing: Crepe | undefined;
   try {
     if (!container.value) return;
     await new Promise<void>((resolve) =>
@@ -438,6 +450,7 @@ onMounted(async () => {
         },
       },
     });
+    initializing = instance;
     instance.editor.config((context) => {
       context.update(uploadConfig.key, (previous) => ({
         ...previous,
@@ -458,13 +471,10 @@ onMounted(async () => {
     instance.editor.use(annotationPlugin);
     instance.on((listener) => {
       listener.markdownUpdated((_context, markdown) => {
+        const previous = editorMarkdown;
         editorMarkdown = markdown;
-        if (externalMarkdown !== undefined) {
-          const external = externalMarkdown;
-          externalMarkdown = undefined;
-          if (equivalentMarkdown(markdown, external)) return;
-        }
-        if (!applyingExternalChange && markdown !== props.modelValue)
+        if (editorFailed.value) return;
+        if (!applyingExternalChange && markdown !== previous && markdown !== props.modelValue)
           emit('update:modelValue', markdown);
       });
     });
@@ -485,6 +495,11 @@ onMounted(async () => {
     applyingExternalChange = false;
     editorReady.value = true;
     emit('ready');
+  } catch (error) {
+    await initializing?.destroy().catch(() => {});
+    editorFailed.value = true;
+    emit('error', String(error));
+    emit('incompatible');
   } finally {
     resolveReady();
   }
@@ -495,9 +510,12 @@ watch(
   (value) => {
     if (!crepe || editorMarkdown === value) return;
     applyingExternalChange = true;
-    externalMarkdown = value;
     crepe.editor.action(replaceAll(value));
-    editorMarkdown = value;
+    editorMarkdown = crepe.getMarkdown();
+    if (!equivalentMarkdown(editorMarkdown, value)) {
+      editorFailed.value = true;
+      emit('incompatible');
+    }
     applyingExternalChange = false;
   },
 );
@@ -544,16 +562,22 @@ onBeforeUnmount(() => {
       class="rendered-editor min-w-0 overflow-x-hidden transition-opacity duration-150"
       :class="[
         editorReady ? 'opacity-100' : 'opacity-0',
-        embedded ? 'rendered-editor-embedded' : 'h-full overflow-y-auto px-8 py-7',
+        embedded ? 'rendered-editor-embedded' : 'h-full overflow-y-auto',
         !embedded && modelValue.length >= 100_000 ? 'rendered-editor-large' : '',
       ]"
       @click.capture="handleRenderedClick"
       @scroll.passive="keepHorizontalPosition"
     />
     <LoadingState
-      v-if="!editorReady"
+      v-if="!editorReady && !editorFailed"
       class="absolute inset-0"
       :label="locale === 'en' ? 'Preparing document…' : '正在排版文档…'"
+    />
+    <DiagramViewer
+      v-if="expandedDiagram"
+      :svg="expandedDiagram"
+      :locale="locale"
+      @close="expandedDiagram = ''"
     />
   </div>
 </template>
@@ -571,12 +595,16 @@ onBeforeUnmount(() => {
 }
 
 .rendered-editor .milkdown .ProseMirror {
-  padding: 60px 8%;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 32px clamp(24px, 5vw, 64px) 100px;
   overflow-x: clip;
 }
 
 .rendered-editor-embedded .milkdown .ProseMirror {
-  padding: 8px 8%;
+  padding-block: 1px;
 }
 
 .rendered-editor-large .milkdown .ProseMirror > .milkdown-table-block {
@@ -597,6 +625,9 @@ onBeforeUnmount(() => {
 .rendered-editor .milkdown .milkdown-code-block .preview svg {
   display: block;
   margin: 0 auto;
+  max-width: 100%;
+  height: auto;
+  cursor: zoom-in;
 }
 
 .rendered-editor .milkdown .vivin-mermaid-load {
@@ -611,9 +642,9 @@ onBeforeUnmount(() => {
 }
 
 .rendered-editor .milkdown .milkdown-code-block .preview:has(svg[id^='vivin-mermaid-']) {
-  padding: 12px;
-  border-radius: 6px;
-  background: #fff;
+  padding: 20px 8px;
+  border-radius: 10px;
+  background: var(--document-background, #fff);
 }
 
 .rendered-editor .milkdown .vivin-mermaid-error {

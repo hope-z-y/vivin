@@ -241,7 +241,7 @@ defineExpose({ revealAnnotation, revealHeading });
 </script>
 
 <template>
-  <div ref="scrollHost" class="h-full min-w-0 overflow-x-hidden overflow-y-auto px-8 py-7">
+  <div ref="scrollHost" class="h-full min-w-0 overflow-x-hidden overflow-y-auto py-10">
     <div
       v-for="(segment, index) in segments"
       :key="segment.id"

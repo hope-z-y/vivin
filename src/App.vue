@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   CodeXml,
+  Eye,
   FilePlus2,
   FileText,
   Folder,
@@ -22,7 +23,9 @@ import {
   Search,
   Sun,
   Trash2,
+  Undo2,
   X,
+  WandSparkles,
 } from '@lucide/vue';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -42,6 +45,7 @@ import LoadingState from './components/loading-state.vue';
 import MarkdownOutlinePanel from './components/markdown-outline-panel.vue';
 import { annotationMarks, resolveAnnotation } from './lib/annotation-anchor';
 import { createTextMatcher } from './lib/text-matcher';
+import { formatDocument } from './lib/format-document';
 import {
   bridgeInfo,
   chooseProject,
@@ -103,8 +107,13 @@ const MarkdownSourceEditor = defineAsyncComponent({
   loadingComponent: LoadingState,
   delay: 0,
 });
+const MarkdownPreview = defineAsyncComponent({
+  loader: () => import('./components/markdown-preview.vue'),
+  loadingComponent: LoadingState,
+  delay: 0,
+});
 
-type Mode = 'source' | 'rendered';
+type Mode = 'source' | 'rendered' | 'preview';
 const virtualDocumentThreshold = 80_000;
 type SidePanel = 'none' | 'search' | 'terms' | 'annotations' | 'history';
 interface DocState extends Document {
@@ -172,6 +181,12 @@ const docs = ref<Record<string, DocState>>({});
 const markContents = shallowRef<Record<string, string>>({});
 const panes = ref<Pane[]>([emptyPane()]);
 const activePane = ref(0);
+const autoFormat = ref(readPreference<unknown>('vivin.auto-format', true) !== false);
+const formattingPaths = ref(new Set<string>());
+const formatSnapshots = shallowRef<
+  Record<string, { doc: DocState; before: string; after: string }>
+>({});
+const preservedFormatting = new WeakMap<DocState, string>();
 const expanded = ref(new Set<string>());
 const sidebar = ref(true);
 const maxSidebarWidth = ref(Math.max(200, Math.min(420, window.innerWidth - 480)));
@@ -260,6 +275,7 @@ function kindLabel(kind: AnnotationKind) {
 }
 watch(locale, (value) => localStorage.setItem('vivin.locale', JSON.stringify(value)));
 watch(theme, (value) => localStorage.setItem('vivin.theme', JSON.stringify(value)));
+watch(autoFormat, (value) => localStorage.setItem('vivin.auto-format', JSON.stringify(value)));
 watch(sidebarWidth, (value) => localStorage.setItem('vivin.sidebar-width', JSON.stringify(value)));
 function rememberProject(next: ProjectInfo) {
   recentProjects.value = [
@@ -461,6 +477,7 @@ async function switchProject(create: boolean) {
   }
 }
 function activateProject(next: ProjectInfo) {
+  formatSnapshots.value = {};
   pendingJump = null;
   pendingHeadingJumps.clear();
   selectedAnnotation.value = null;
@@ -557,7 +574,12 @@ async function openDoc(path: string, paneIndex = activePane.value) {
     if (!pane) return;
     pane.path = path;
     pane.outlineOpen = false;
-    if (lockSource(path) || path === 'AGENTS.md') pane.mode = 'source';
+    if (path === 'AGENTS.md') pane.mode = 'source';
+    else if (
+      lockSource(path) ||
+      (docs.value[path]?.content.length ?? 0) >= virtualDocumentThreshold
+    )
+      pane.mode = 'preview';
     else pane.mode = 'rendered';
     activePane.value = paneIndex;
     panel.value = 'none';
@@ -594,7 +616,7 @@ async function jumpTo(path: string, offset: number, length = 0, annotationId?: s
   const paneIndex = activePane.value;
   const pane = panes.value[paneIndex];
   if (!pane) return;
-  if (!annotationId || pane.mode === 'source') {
+  if (!annotationId || pane.mode !== 'rendered') {
     pendingJump = null;
     sourceRevealRequests.value[paneIndex] = {
       offset,
@@ -612,7 +634,7 @@ async function jumpTo(path: string, offset: number, length = 0, annotationId?: s
 async function revealPendingJump(index: number) {
   const jump = pendingJump;
   if (!jump || jump.paneIndex !== index || panes.value[index]?.path !== jump.path) return;
-  if (jump.annotationId && panes.value[index]?.mode === 'rendered') {
+  if (jump.annotationId && panes.value[index]?.mode !== 'source') {
     const editor = renderedEditors[index];
     if (!editor) return;
     const found = await editor.revealAnnotation(jump.annotationId);
@@ -644,7 +666,7 @@ async function jumpToHeading(index: number, offset: number) {
   if (!pane?.path) return;
   activePane.value = index;
   pane.outlineOpen = false;
-  if (pane.mode === 'source' || lockSource(pane.path) || pane.path === 'AGENTS.md') {
+  if (pane.mode === 'source' || pane.path === 'AGENTS.md') {
     sourceRevealRequests.value[index] = { offset, length: 0, token: ++revealToken };
     return;
   }
@@ -692,6 +714,63 @@ function setRenderedEditor(value: unknown, index: number) {
 function renderedEditorRef(index: number) {
   return (renderedEditorRefs[index] ??= (value) => setRenderedEditor(value, index));
 }
+async function formatOne(path: string, manual = false) {
+  const doc = docs.value[path];
+  if (!doc || doc.conflict || lockSource(path) || formattingPaths.value.has(path)) return;
+  const original = doc.content;
+  const revision = doc.revision;
+  formattingPaths.value.add(path);
+  try {
+    const formatted = await formatDocument(original);
+    if (
+      docs.value[path] !== doc ||
+      doc.content !== original ||
+      doc.revision !== revision ||
+      doc.conflict ||
+      lockSource(path)
+    )
+      return;
+    setContent(path, formatted);
+    if (formatted !== original) {
+      formatSnapshots.value = {
+        ...formatSnapshots.value,
+        [path]: { doc, before: original, after: formatted },
+      };
+    }
+    if (manual)
+      message.value =
+        formatted === original
+          ? translate('文档格式已规范', 'Document is already formatted.')
+          : translate(
+              '已格式化，可使用工具栏撤销格式化',
+              'Formatted. Use the toolbar to undo formatting.',
+            );
+  } catch (error) {
+    message.value =
+      translate('为保留原文，已跳过格式化：', 'Formatting skipped to preserve the source: ') +
+      String(error);
+  } finally {
+    formattingPaths.value.delete(path);
+  }
+}
+function canUndoFormat(path: string) {
+  const snapshot = formatSnapshots.value[path];
+  const doc = docs.value[path];
+  return (
+    !!snapshot &&
+    snapshot.doc === doc &&
+    snapshot.after === doc?.content &&
+    !doc.conflict &&
+    !lockSource(path)
+  );
+}
+function undoFormat(path: string) {
+  const snapshot = formatSnapshots.value[path];
+  if (!snapshot || !canUndoFormat(path)) return;
+  preservedFormatting.set(snapshot.doc, snapshot.before);
+  setContent(path, snapshot.before);
+  message.value = translate('已撤销格式化', 'Formatting undone.');
+}
 function setContent(path: string, content: string) {
   const doc = docs.value[path];
   if (!doc || lockSource(path) || doc.content === content) return;
@@ -733,11 +812,17 @@ async function saveOne(path: string) {
   const doc = docs.value[path];
   if (!doc || doc.saving || doc.conflict || doc.content === doc.savedContent || lockSource(path))
     return;
+  if (formattingPaths.value.has(path)) return;
+  doc.saving = true;
+  if (autoFormat.value && preservedFormatting.get(doc) !== doc.content) await formatOne(path);
+  if (docs.value[path] !== doc || doc.conflict || lockSource(path)) {
+    doc.saving = false;
+    return;
+  }
   const draftTimer = draftTimers.get(path);
   if (draftTimer) clearTimeout(draftTimer);
   draftTimers.delete(path);
   draftSequences.set(path, (draftSequences.get(path) ?? 0) + 1);
-  doc.saving = true;
   const submitted = doc.content;
   try {
     const saved =
@@ -1420,6 +1505,12 @@ function clampSidebarOnWindowResize() {
   sidebarWidth.value = clampSidebarWidth(sidebarWidth.value);
 }
 function shortcut(event: KeyboardEvent) {
+  if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'f') {
+    event.preventDefault();
+    const path = panes.value[activePane.value]?.path;
+    if (path) void formatOne(path, true);
+    return;
+  }
   if (event.key === 'Escape' && dialog.value) {
     finishDialog(false);
     return;
@@ -2074,10 +2165,10 @@ onBeforeUnmount(() => {
                   />
                   <div
                     v-else-if="pane.path && docs[pane.path]"
-                    :key="`${pane.path}:${pane.mode}`"
+                    :key="pane.path"
                     class="flex min-h-0 flex-1 flex-col"
                   >
-                    <div class="relative flex h-11 shrink-0 items-center gap-2 px-6 text-sm">
+                    <div class="document-toolbar relative shrink-0 text-sm">
                       <span
                         :class="[
                           'min-w-0 flex-1 truncate font-medium',
@@ -2105,7 +2196,7 @@ onBeforeUnmount(() => {
                               )
                         }}</span></span
                       >
-                      <div class="flex shrink-0 items-center gap-1.5 text-slate-500">
+                      <div class="document-actions flex shrink-0 items-center gap-2 text-slate-500">
                         <button
                           class="rounded-md p-1.5 hover:bg-slate-100"
                           :class="pane.outlineOpen ? 'bg-blue-50 text-blue-700' : ''"
@@ -2117,32 +2208,98 @@ onBeforeUnmount(() => {
                         >
                           <ListTree :size="17" />
                         </button>
-                        <button
-                          v-for="mode in ['source', 'rendered'] as const"
-                          :key="mode"
-                          class="rounded-md p-1.5 hover:bg-slate-100 disabled:opacity-40"
-                          :class="pane.mode === mode ? 'bg-blue-50 text-blue-700' : ''"
-                          :disabled="!!lockSource(pane.path) || pane.path === 'AGENTS.md'"
-                          :title="
-                            mode === 'source'
-                              ? translate('原文', 'Source')
-                              : translate('排版', 'Rendered')
-                          "
-                          :aria-label="
-                            mode === 'source'
-                              ? translate('原文', 'Source')
-                              : translate('排版', 'Rendered')
-                          "
-                          :aria-pressed="pane.mode === mode"
-                          @click.stop="
-                            activePane = index;
-                            pane.mode = mode;
-                            pane.outlineOpen = false;
-                          "
+                        <div
+                          class="view-switch"
+                          role="group"
+                          :aria-label="translate('文档视图', 'Document view')"
                         >
-                          <CodeXml v-if="mode === 'source'" :size="17" />
-                          <BookOpenText v-else :size="17" />
+                          <button
+                            v-for="mode in ['source', 'rendered', 'preview'] as const"
+                            :key="mode"
+                            class="view-switch-button disabled:opacity-40"
+                            :class="pane.mode === mode ? 'is-active' : ''"
+                            :disabled="
+                              (mode === 'rendered' && !!lockSource(pane.path)) ||
+                              (mode !== 'source' && pane.path === 'AGENTS.md')
+                            "
+                            :title="
+                              mode === 'source'
+                                ? translate('原文', 'Source')
+                                : mode === 'rendered'
+                                  ? translate('排版编辑', 'Edit')
+                                  : translate('只读预览', 'Preview')
+                            "
+                            :aria-label="
+                              mode === 'source'
+                                ? translate('原文', 'Source')
+                                : mode === 'rendered'
+                                  ? translate('排版编辑', 'Edit')
+                                  : translate('只读预览', 'Preview')
+                            "
+                            :aria-pressed="pane.mode === mode"
+                            @click.stop="
+                              activePane = index;
+                              pane.mode = mode;
+                              pane.outlineOpen = false;
+                            "
+                          >
+                            <CodeXml v-if="mode === 'source'" :size="14" />
+                            <BookOpenText v-else-if="mode === 'rendered'" :size="14" />
+                            <Eye v-else :size="14" />
+                            <span>{{
+                              mode === 'source'
+                                ? translate('原文', 'Source')
+                                : mode === 'rendered'
+                                  ? translate('编辑', 'Edit')
+                                  : translate('预览', 'Preview')
+                            }}</span>
+                          </button>
+                        </div>
+                        <button
+                          class="format-button"
+                          :disabled="
+                            !!lockSource(pane.path) ||
+                            docs[pane.path]?.conflict ||
+                            formattingPaths.has(pane.path)
+                          "
+                          :title="
+                            translate(
+                              '格式化文档（⌘/Ctrl+Shift+F）',
+                              'Format document (⌘/Ctrl+Shift+F)',
+                            )
+                          "
+                          :aria-label="translate('格式化文档', 'Format document')"
+                          @click.stop="formatOne(pane.path!, true)"
+                        >
+                          <LoaderCircle
+                            v-if="formattingPaths.has(pane.path)"
+                            :size="16"
+                            class="animate-spin"
+                          /><WandSparkles v-else :size="16" />
                         </button>
+                        <button
+                          v-if="canUndoFormat(pane.path)"
+                          class="format-button"
+                          :title="translate('撤销格式化', 'Undo formatting')"
+                          :aria-label="translate('撤销格式化', 'Undo formatting')"
+                          @click.stop="undoFormat(pane.path!)"
+                        >
+                          <Undo2 :size="16" />
+                        </button>
+                        <label
+                          class="auto-format-control"
+                          :title="
+                            translate(
+                              '保存时自动格式化，仅处理已修改的文档',
+                              'Automatically format changed documents on save',
+                            )
+                          "
+                          @click.stop
+                        >
+                          <input v-model="autoFormat" type="checkbox" /><span>{{
+                            translate('自动格式化', 'Auto format')
+                          }}</span>
+                        </label>
                       </div>
                       <MarkdownOutlinePanel
                         v-if="pane.outlineOpen"
@@ -2151,6 +2308,23 @@ onBeforeUnmount(() => {
                         :locale="locale"
                         @select="jumpToHeading(index, $event)"
                       />
+                    </div>
+                    <div v-if="pane.mode === 'preview'" class="preview-notice">
+                      <Eye :size="13" /><span
+                        >{{ translate('只读预览', 'Read-only preview')
+                        }}{{
+                          (docs[pane.path]?.content.length ?? 0) >= virtualDocumentThreshold
+                            ? translate(' · 长文按需渲染', ' · Long document rendered on demand')
+                            : ''
+                        }}</span
+                      >
+                      <button
+                        v-if="!lockSource(pane.path)"
+                        class="ml-auto hover:underline"
+                        @click="pane.mode = 'source'"
+                      >
+                        {{ translate('编辑原文', 'Edit source') }}
+                      </button>
                     </div>
                     <div
                       v-if="docs[pane.path]?.conflict"
@@ -2179,11 +2353,7 @@ onBeforeUnmount(() => {
                     </div>
                     <div class="flex min-h-0 flex-1">
                       <MarkdownSourceEditor
-                        v-if="
-                          pane.mode === 'source' ||
-                          !!lockSource(pane.path) ||
-                          pane.path === 'AGENTS.md'
-                        "
+                        v-if="pane.mode === 'source' || pane.path === 'AGENTS.md'"
                         :key="`${index}:${pane.path}:source`"
                         :ref="sourceEditorRef(index)"
                         :model-value="docs[pane.path]?.content ?? ''"
@@ -2201,14 +2371,27 @@ onBeforeUnmount(() => {
                             addAnnotation(kind, selected);
                           }
                         "
-                      /><component
+                      />
+                      <MarkdownPreview
+                        v-else-if="pane.mode === 'preview'"
+                        :key="`${index}:${pane.path}:preview`"
+                        :ref="renderedEditorRef(index)"
+                        :model-value="docs[pane.path]?.content ?? ''"
+                        :document-path="pane.path"
+                        :locale="locale"
+                        :theme="theme"
+                        class="min-w-0 flex-1"
+                        @error="message = $event"
+                        @open-reference="openReference(pane.path!, $event)"
+                      />
+                      <component
                         v-else
                         :is="
                           (docs[pane.path]?.content.length ?? 0) >= virtualDocumentThreshold
                             ? MarkdownVirtualEditor
                             : MarkdownRenderedEditor
                         "
-                        :key="`${index}:${pane.path}:rendered:${locale}:${(docs[pane.path]?.content.length ?? 0) >= virtualDocumentThreshold ? 'virtual' : 'single'}`"
+                        :key="`${index}:${pane.path}:rendered:${locale}:${theme}:${(docs[pane.path]?.content.length ?? 0) >= virtualDocumentThreshold ? 'virtual' : 'single'}`"
                         :ref="renderedEditorRef(index)"
                         :model-value="docs[pane.path]?.content ?? ''"
                         :document-path="pane.path"
@@ -2224,10 +2407,10 @@ onBeforeUnmount(() => {
                             requestEditorAnnotation(index, kind, selected)
                         "
                         @incompatible="
-                          pane.mode = 'source';
+                          pane.mode = 'preview';
                           message = translate(
-                            '排版模式无法完整保留此 Markdown，已切回原文模式',
-                            'Rendered mode cannot preserve this Markdown; switched to source mode',
+                            '此 Markdown 无法安全排版编辑，已打开只读预览；可切换原文编辑',
+                            'Opened read-only preview to preserve this Markdown. Switch to source to edit.',
                           );
                         "
                       />
@@ -2586,7 +2769,7 @@ onBeforeUnmount(() => {
     </div>
     <div
       v-if="message"
-      class="fixed right-5 top-16 z-[90] max-w-sm rounded-xl bg-slate-800 px-4 py-2 text-xs text-white shadow-xl"
+      class="fixed right-5 bottom-5 z-[90] max-w-sm rounded-xl bg-slate-800 px-4 py-2 text-xs text-white shadow-xl"
       role="status"
     >
       {{ message

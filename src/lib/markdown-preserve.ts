@@ -35,13 +35,19 @@ export function preserveMarkdownBlocks(tree: MarkdownNode, source: string) {
     }
     if (from < frontmatterEnd) {
       if (!frontmatterAdded) {
-        children.push({ type: 'vivinSource', value: source.slice(0, frontmatterEnd) });
+        children.push({
+          type: 'vivinSource',
+          value: source.slice(0, frontmatterEnd),
+          position: { start: { offset: 0 }, end: { offset: frontmatterEnd } },
+        });
         frontmatterAdded = true;
       }
       continue;
     }
     children.push(
-      needsSource(node) ? { type: 'vivinSource', value: source.slice(from, to) } : node,
+      needsSource(node)
+        ? { type: 'vivinSource', value: source.slice(from, to), position: node.position }
+        : node,
     );
   }
   tree.children = children;

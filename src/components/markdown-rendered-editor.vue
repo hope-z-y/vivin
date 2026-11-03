@@ -12,7 +12,13 @@ import type { AnnotationMark } from '../lib/annotation-anchor';
 import { markdownHeadings } from '../lib/markdown-outline';
 import type { AnnotationKind } from '../lib/project-api';
 import { equivalentMarkdown } from '../lib/markdown-roundtrip';
-import { createTextMatcher } from '../lib/text-matcher';
+import {
+  renderedTextMap,
+  renderedRanges,
+  nearestRenderedPosition,
+  type RenderedTextRun,
+} from '../lib/rendered-text-map';
+import { replaceDocumentMatches, type SearchRange } from '../lib/document-search';
 import {
   getCachedMermaidPreview,
   renderMermaidPreview,
@@ -27,6 +33,8 @@ const props = defineProps<{
   documentPath: string;
   readonly?: boolean;
   annotations?: AnnotationMark[];
+  searchMatches?: SearchRange[];
+  activeSearchOffset?: number;
   terms?: { id: string; offset: number; quote: string }[];
   locale?: 'zh' | 'en';
   theme?: 'light' | 'dark';
@@ -144,6 +152,48 @@ function keepHorizontalPosition() {
   if (container.value?.scrollLeft) container.value.scrollLeft = 0;
 }
 
+let indexedDocument: object | undefined;
+let indexedSource = '';
+let textMapping = new Map<number, number>();
+function sourceMapping(state: EditorState) {
+  if (indexedDocument !== state.doc || indexedSource !== props.modelValue) {
+    const runs: RenderedTextRun[] = [];
+    state.doc.descendants((node, position) => {
+      if (node.isText && node.text) runs.push({ text: node.text, position });
+      if (node.type.name === 'math_inline' && typeof node.attrs.value === 'string') {
+        runs.push({ text: node.attrs.value, position, atomic: true });
+      }
+    });
+    textMapping = renderedTextMap(props.modelValue, runs);
+    indexedDocument = state.doc;
+    indexedSource = props.modelValue;
+  }
+  return textMapping;
+}
+async function reveal(offset: number, length = 0): Promise<boolean> {
+  await ready;
+  if (!crepe || disposed) return false;
+  return crepe.editor.action((context) => {
+    const view = context.get(editorViewCtx);
+    const mapping = sourceMapping(view.state);
+    const position =
+      renderedRanges(mapping, offset, Math.max(1, length))[0]?.from ??
+      nearestRenderedPosition(mapping, offset);
+    if (position === undefined) return false;
+    const dom = view.domAtPos(position).node;
+    const element = dom instanceof Element ? dom : dom.parentElement;
+    element?.scrollIntoView({ block: 'center', inline: 'nearest' });
+    return Boolean(element);
+  });
+}
+function replaceMatches(matches: SearchRange[], replacement: string) {
+  if (props.readonly || !crepe) return;
+  flush();
+  const value = replaceDocumentMatches(props.modelValue, matches, replacement);
+  applyMarkdown(value, true);
+  emit('update:modelValue', value);
+}
+
 async function revealAnnotation(id: string): Promise<boolean> {
   await ready;
   const node = [
@@ -209,7 +259,14 @@ const documentSyncPlugin = $prose(
     }),
 );
 
-defineExpose({ revealAnnotation, revealHeading, flush });
+defineExpose({
+  reveal,
+  revealAnnotation,
+  revealHeading,
+  flush,
+  replaceMatches,
+  focus: () => crepe?.editor.action((context) => context.get(editorViewCtx).focus()),
+});
 
 async function proxyImage(url: string): Promise<string> {
   if (/^(https?:|data:|blob:)/i.test(url)) return url;
@@ -281,106 +338,55 @@ function requestAnnotation(kind: AnnotationKind, context: Ctx) {
 }
 
 const annotationPlugin = $prose(() => {
-  let cachedRendered = '';
-  let textRuns: { start: number; end: number; position: number }[] = [];
-  let indexedDoc: object | undefined;
-  const positionAt = (offset: number): number | undefined => {
-    let left = 0;
-    let right = textRuns.length - 1;
-    while (left <= right) {
-      const middle = (left + right) >>> 1;
-      const run = textRuns[middle];
-      if (!run) return undefined;
-      if (offset < run.start) right = middle - 1;
-      else if (offset >= run.end) left = middle + 1;
-      else return run.position + offset - run.start;
-    }
-    return undefined;
-  };
   const buildDecorations = (state: EditorState): DecorationSet => {
-    if (indexedDoc !== state.doc) {
-      textRuns = [];
-      const renderedChunks: string[] = [];
-      let renderedLength = 0;
-      state.doc.descendants((node, position) => {
-        if (!node.isText || !node.text) return;
-        textRuns.push({
-          start: renderedLength,
-          end: renderedLength + node.text.length,
-          position,
-        });
-        renderedChunks.push(node.text);
-        renderedLength += node.text.length;
-      });
-      cachedRendered = renderedChunks.join('');
-      indexedDoc = state.doc;
-    }
-    const quotes = [
-      ...new Set([...(props.annotations ?? []), ...(props.terms ?? [])].map((mark) => mark.quote)),
-    ];
-    const matchQuotes = createTextMatcher(quotes.map((quote) => ({ text: quote, value: quote })));
-    const rawRanks = new Map<string, Map<number, number>>();
-    const renderedOccurrences = new Map<string, number[]>();
-    const rawEnds = new Map<string, number>();
-    for (const match of matchQuotes(props.modelValue)) {
-      if (match.offset < (rawEnds.get(match.value) ?? 0)) continue;
-      rawEnds.set(match.value, match.offset + match.length);
-      let ranks = rawRanks.get(match.value);
-      if (!ranks) {
-        ranks = new Map();
-        rawRanks.set(match.value, ranks);
-      }
-      ranks.set(match.offset, ranks.size);
-    }
-    const renderedEnds = new Map<string, number>();
-    for (const match of matchQuotes(cachedRendered)) {
-      if (match.offset < (renderedEnds.get(match.value) ?? 0)) continue;
-      renderedEnds.set(match.value, match.offset + match.length);
-      let positions = renderedOccurrences.get(match.value);
-      if (!positions) {
-        positions = [];
-        renderedOccurrences.set(match.value, positions);
-      }
-      positions.push(match.offset);
-    }
-    const visibleOffset = (quote: string, rawOffset: number): number | undefined => {
-      const ranks = rawRanks.get(quote);
-      const rendered = renderedOccurrences.get(quote);
-      if (!ranks || !rendered || ranks.size !== rendered.length) return undefined;
-      const rank = ranks.get(rawOffset);
-      return rank === undefined ? undefined : rendered[rank];
-    };
+    const mapping = sourceMapping(state);
     const decorations: ReturnType<typeof Decoration.inline>[] = [];
     for (const mark of props.annotations ?? []) {
-      const start = visibleOffset(mark.quote, mark.offset);
-      if (start === undefined) continue;
-      const from = positionAt(start);
-      const last = positionAt(start + mark.quote.length - 1);
-      if (from === undefined || last === undefined) continue;
-      const to = last + 1;
-      if (!state.doc.resolve(from).sameParent(state.doc.resolve(to))) continue;
-      decorations.push(
-        Decoration.inline(from, to, {
-          class: `vivin-annotation vivin-annotation-${mark.kind}`,
-          'data-annotation-id': mark.id,
-        }),
-      );
+      for (const range of renderedRanges(mapping, mark.offset, mark.length)) {
+        decorations.push(
+          Decoration.inline(range.from, range.to, {
+            class: `vivin-annotation vivin-annotation-${mark.kind}`,
+            'data-annotation-id': mark.id,
+          }),
+        );
+      }
     }
     for (const mark of props.terms ?? []) {
-      const start = visibleOffset(mark.quote, mark.offset);
-      if (start === undefined) continue;
-      const from = positionAt(start);
-      const last = positionAt(start + mark.quote.length - 1);
-      if (from === undefined || last === undefined) continue;
-      const to = last + 1;
-      if (!state.doc.resolve(from).sameParent(state.doc.resolve(to))) continue;
-      decorations.push(
-        Decoration.inline(from, to, {
-          class: 'vivin-term',
-          'data-term-id': mark.id,
-          'data-term-offset': String(mark.offset),
-        }),
-      );
+      for (const range of renderedRanges(mapping, mark.offset, mark.quote.length)) {
+        decorations.push(
+          Decoration.inline(range.from, range.to, {
+            class: 'vivin-term',
+            'data-term-id': mark.id,
+            'data-term-offset': String(mark.offset),
+          }),
+        );
+      }
+    }
+    const highlightedBlocks = new Map<number, { to: number; className: string }>();
+    for (const match of props.searchMatches ?? []) {
+      const className =
+        match.offset === props.activeSearchOffset
+          ? 'vivin-search-match vivin-search-active'
+          : 'vivin-search-match';
+      const ranges = renderedRanges(mapping, match.offset, match.length);
+      for (const range of ranges) {
+        decorations.push(Decoration.inline(range.from, range.to, { class: className }));
+      }
+      const position = ranges[0]?.from ?? nearestRenderedPosition(mapping, match.offset);
+      if (position === undefined) continue;
+      const resolved = state.doc.resolve(position);
+      // Code blocks use their own CodeMirror node view; highlight the block as
+      // well so a match stays visible while a Mermaid/formula preview is shown.
+      if (resolved.depth && (!ranges.length || resolved.parent.type.name === 'code_block')) {
+        const from = resolved.before();
+        const previous = highlightedBlocks.get(from);
+        if (!previous || match.offset === props.activeSearchOffset) {
+          highlightedBlocks.set(from, { to: resolved.after(), className });
+        }
+      }
+    }
+    for (const [from, block] of highlightedBlocks) {
+      decorations.push(Decoration.node(from, block.to, { class: block.className }));
     }
     return DecorationSet.create(state.doc, decorations);
   };
@@ -569,44 +575,54 @@ onMounted(async () => {
   }
 });
 
+function applyMarkdown(value: string, addToHistory = false) {
+  if (!crepe || editorMarkdown === value) return;
+  const scrollTop = container.value?.scrollTop ?? 0;
+  if (changeTimer) clearTimeout(changeTimer);
+  pendingChanges = false;
+  applyingExternalChange = true;
+  crepe.editor.action((context) => {
+    const view = context.get(editorViewCtx);
+    let doc = context.get(parserCtx)(value);
+    if (!doc) return;
+    if (!equivalentMarkdown(context.get(serializerCtx)(doc), value)) {
+      const schema = context.get(schemaCtx);
+      const raw = sourceBlock.type(context).create(null, value ? schema.text(value) : undefined);
+      doc = schema.topNodeType.create(null, raw);
+    }
+    const start = view.state.doc.content.findDiffStart(doc.content);
+    if (start === null) return;
+    const end = view.state.doc.content.findDiffEnd(doc.content);
+    let endBefore = end?.a ?? start;
+    let endAfter = end?.b ?? start;
+    const overlap = start - Math.min(endBefore, endAfter);
+    if (overlap > 0) {
+      endBefore += overlap;
+      endAfter += overlap;
+    }
+    view.dispatch(
+      view.state.tr
+        .replace(start, endBefore, doc.slice(start, endAfter))
+        .setMeta('addToHistory', addToHistory),
+    );
+  });
+  editorMarkdown = value;
+  void nextTick(() => {
+    if (container.value) container.value.scrollTop = scrollTop;
+  });
+  applyingExternalChange = false;
+}
 watch(
   () => props.modelValue,
-  (value) => {
-    if (!crepe || editorMarkdown === value) return;
-    const scrollTop = container.value?.scrollTop ?? 0;
-    if (changeTimer) clearTimeout(changeTimer);
-    pendingChanges = false;
-    applyingExternalChange = true;
-    crepe.editor.action((context) => {
+  (value) => applyMarkdown(value),
+);
+watch(
+  () => [props.searchMatches, props.activeSearchOffset],
+  () => {
+    crepe?.editor.action((context) => {
       const view = context.get(editorViewCtx);
-      let doc = context.get(parserCtx)(value);
-      if (!doc) return;
-      if (!equivalentMarkdown(context.get(serializerCtx)(doc), value)) {
-        const schema = context.get(schemaCtx);
-        const raw = sourceBlock.type(context).create(null, value ? schema.text(value) : undefined);
-        doc = schema.topNodeType.create(null, raw);
-      }
-      const start = view.state.doc.content.findDiffStart(doc.content);
-      if (start === null) return;
-      const end = view.state.doc.content.findDiffEnd(doc.content);
-      let endBefore = end?.a ?? start;
-      let endAfter = end?.b ?? start;
-      const overlap = start - Math.min(endBefore, endAfter);
-      if (overlap > 0) {
-        endBefore += overlap;
-        endAfter += overlap;
-      }
-      view.dispatch(
-        view.state.tr
-          .replace(start, endBefore, doc.slice(start, endAfter))
-          .setMeta('addToHistory', false),
-      );
+      view.dispatch(view.state.tr.setMeta(markRefreshKey, true));
     });
-    editorMarkdown = crepe.getMarkdown();
-    void nextTick(() => {
-      if (container.value) container.value.scrollTop = scrollTop;
-    });
-    applyingExternalChange = false;
   },
 );
 

@@ -42,6 +42,8 @@ import {
 import AppTitlebar from './components/app-titlebar.vue';
 import EmptyPanel from './components/empty-panel.vue';
 import LoadingState from './components/loading-state.vue';
+import DocumentFind from './components/document-find.vue';
+import type { SearchRange } from './lib/document-search';
 import MarkdownOutlinePanel from './components/markdown-outline-panel.vue';
 import { annotationMarks, resolveAnnotation } from './lib/annotation-anchor';
 import { createTextMatcher } from './lib/text-matcher';
@@ -116,16 +118,24 @@ interface Pane {
   mode: Mode;
   outlineOpen: boolean;
   filters: AnnotationKind[];
+  findOpen: boolean;
+  searchMatches: SearchRange[];
+  activeSearchOffset?: number;
 }
 interface Row {
   node: TreeNode;
   depth: number;
 }
 interface EditorHandle {
-  reveal(offset: number, length?: number): Promise<void>;
+  reveal(offset: number, length?: number, focus?: boolean): Promise<void>;
+  focus(): void;
+  replaceMatches(matches: SearchRange[], replacement: string): void;
   selectedText(): { quote: string; offset: number } | null;
 }
 interface RenderedEditorHandle {
+  reveal(offset: number, length?: number): Promise<boolean>;
+  focus(): void;
+  replaceMatches(matches: SearchRange[], replacement: string): void;
   flush(): void;
   revealAnnotation(id: string): Promise<boolean>;
   revealHeading(offset: number): Promise<boolean>;
@@ -161,6 +171,8 @@ const emptyPane = (): Pane => ({
   id: nextPaneId++,
   path: null,
   mode: 'rendered',
+  findOpen: false,
+  searchMatches: [],
   outlineOpen: false,
   filters: kinds.map((kind) => kind.value),
 });
@@ -194,6 +206,7 @@ const readingPanel = computed(() => panel.value === 'terms');
 const annotationFilter = ref<AnnotationKind>('todo');
 const query = ref('');
 const hits = ref<SearchHit[]>([]);
+const searchedQuery = ref('');
 const selectedAnnotation = ref<Annotation | null>(null);
 const annotationPopoverAt = ref({ x: 0, y: 0 });
 const annotationPopoverSize = ref({ width: 320, height: 240 });
@@ -310,6 +323,7 @@ function confirmAction(title: string): Promise<boolean> {
     dialogResolve = resolve as (value: string | boolean | null) => void;
   });
 }
+const findPanels = new Map<number, { focus(selection?: string): void }>();
 const sourceEditors = new Map<number, EditorHandle | null>();
 const renderedEditors = new Map<number, RenderedEditorHandle | null>();
 const sourceEditorRefs = new Map<number, (value: unknown) => void>();
@@ -553,6 +567,10 @@ async function openDoc(path: string, paneIndex = activePane.value) {
     pane.path = path;
     pane.outlineOpen = false;
     pane.mode = 'rendered';
+    pane.findOpen = false;
+    pane.searchMatches = [];
+    pane.activeSearchOffset = undefined;
+    sourceRevealRequests.value[paneIndex] = null;
     activePane.value = paneIndex;
     panel.value = 'none';
   } catch (error) {
@@ -588,14 +606,18 @@ async function jumpTo(path: string, offset: number, length = 0, annotationId?: s
   const paneIndex = activePane.value;
   const pane = panes.value[paneIndex];
   if (!pane) return;
-  if (!annotationId || pane.mode !== 'rendered') {
+  if (!annotationId) {
+    pane.findOpen = false;
+    pane.searchMatches = length ? [{ offset, length }] : [];
+    pane.activeSearchOffset = offset;
+  }
+  if (pane.mode === 'source') {
     pendingJump = null;
     sourceRevealRequests.value[paneIndex] = {
       offset,
       length,
       token: ++revealToken,
     };
-    pane.mode = 'source';
     return;
   }
   pendingJump = { path, paneIndex, offset, length, annotationId };
@@ -606,24 +628,64 @@ async function jumpTo(path: string, offset: number, length = 0, annotationId?: s
 async function revealPendingJump(index: number) {
   const jump = pendingJump;
   if (!jump || jump.paneIndex !== index || panes.value[index]?.path !== jump.path) return;
-  if (jump.annotationId && panes.value[index]?.mode !== 'source') {
+  if (panes.value[index]?.mode === 'rendered') {
     const editor = renderedEditors.get(panes.value[index]?.id ?? -1);
     if (!editor) return;
-    const found = await editor.revealAnnotation(jump.annotationId);
+    const found = jump.annotationId
+      ? (await editor.revealAnnotation(jump.annotationId)) ||
+        (await editor.reveal(jump.offset, jump.length))
+      : await editor.reveal(jump.offset, jump.length);
     if (pendingJump !== jump) return;
     if (found) {
       pendingJump = null;
       return;
     }
-    const pane = panes.value[index];
-    if (pane) pane.mode = 'source';
-    sourceRevealRequests.value[index] = {
-      offset: jump.offset,
-      length: jump.length,
-      token: ++revealToken,
-    };
+    if (!found)
+      message.value = translate(
+        '无法定位这个位置，请重试',
+        'Could not locate this position. Try again.',
+      );
     pendingJump = null;
   }
+}
+
+function closeFind(index: number) {
+  const pane = panes.value[index];
+  if (!pane) return;
+  pane.findOpen = false;
+  pane.searchMatches = [];
+  pane.activeSearchOffset = undefined;
+  if (pane.mode === 'source') sourceEditors.get(pane.id)?.focus();
+  else renderedEditors.get(pane.id)?.focus();
+}
+async function openFind() {
+  flushEditors();
+  const pane = panes.value[activePane.value];
+  if (!pane?.path) return;
+  const selection =
+    pane.mode === 'source' ? sourceEditors.get(pane.id)?.selectedText()?.quote : undefined;
+  pane.findOpen = true;
+  await nextTick();
+  findPanels.get(pane.id)?.focus(selection);
+}
+function setSearchHighlights(index: number, matches: SearchRange[], active: number) {
+  const pane = panes.value[index];
+  if (!pane) return;
+  pane.searchMatches = matches;
+  pane.activeSearchOffset = matches[active]?.offset;
+}
+function navigateFind(index: number, match: SearchRange) {
+  const pane = panes.value[index];
+  if (!pane) return;
+  if (pane.mode === 'source')
+    void sourceEditors.get(pane.id)?.reveal(match.offset, match.length, false);
+  else void renderedEditors.get(pane.id)?.reveal(match.offset, match.length);
+}
+function replaceFind(index: number, matches: SearchRange[], replacement: string) {
+  const pane = panes.value[index];
+  if (!pane?.path || lockSource(pane.path)) return;
+  if (pane.mode === 'source') sourceEditors.get(pane.id)?.replaceMatches(matches, replacement);
+  else renderedEditors.get(pane.id)?.replaceMatches(matches, replacement);
 }
 
 function toggleOutline(index: number) {
@@ -983,6 +1045,7 @@ async function runSearch() {
     const found = await searchDocuments(term);
     if (request === searchRequest && term === query.value) {
       hits.value = found;
+      searchedQuery.value = term.trim();
       searchRan.value = true;
     }
   } catch (error) {
@@ -1481,8 +1544,16 @@ function shortcut(event: KeyboardEvent) {
   }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
     event.preventDefault();
-    panel.value = 'search';
-    void nextTick(() => document.getElementById('vivin-search')?.focus());
+    event.stopPropagation();
+    void openFind();
+    return;
+  }
+  if (event.key === 'Escape' && document.querySelector('dialog[open]')) return;
+  if (event.key === 'Escape' && panes.value[activePane.value]?.findOpen) {
+    event.preventDefault();
+    event.stopPropagation();
+    closeFind(activePane.value);
+    return;
   }
   if (event.key === 'Escape') {
     context.value = null;
@@ -1492,7 +1563,7 @@ function shortcut(event: KeyboardEvent) {
   }
 }
 onMounted(() => {
-  window.addEventListener('keydown', shortcut);
+  window.addEventListener('keydown', shortcut, true);
   window.addEventListener('scroll', positionAnnotationPopover, true);
   window.addEventListener('resize', clampSidebarOnWindowResize);
   if (nativeAvailable()) {
@@ -1609,7 +1680,7 @@ onMounted(() => {
   }, 2500);
 });
 onBeforeUnmount(() => {
-  window.removeEventListener('keydown', shortcut);
+  window.removeEventListener('keydown', shortcut, true);
   window.removeEventListener('scroll', positionAnnotationPopover, true);
   annotationResizeObserver?.disconnect();
   window.removeEventListener('resize', clampSidebarOnWindowResize);
@@ -2039,6 +2110,7 @@ onBeforeUnmount(() => {
                 "
                 class="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-white rounded-2xl"
                 @pointerdown="activePane = index"
+                @focusin="activePane = index"
                 @click.capture="handleEditorClick"
                 @mousemove="
                   handleAnnotationHover($event);
@@ -2190,6 +2262,24 @@ onBeforeUnmount(() => {
                         </label>
                       </div>
                     </div>
+                    <DocumentFind
+                      v-if="pane.findOpen"
+                      :key="`${pane.id}:${pane.path}:find`"
+                      :ref="
+                        (value) => {
+                          if (value)
+                            findPanels.set(pane.id, value as InstanceType<typeof DocumentFind>);
+                          else findPanels.delete(pane.id);
+                        }
+                      "
+                      :content="docs[pane.path]?.content ?? ''"
+                      :readonly="!!lockSource(pane.path)"
+                      :locale="locale"
+                      @highlights="(matches, active) => setSearchHighlights(index, matches, active)"
+                      @navigate="navigateFind(index, $event)"
+                      @replace="(matches, replacement) => replaceFind(index, matches, replacement)"
+                      @close="closeFind(index)"
+                    />
                     <div class="flex min-h-0 flex-1">
                       <MarkdownOutlinePanel
                         v-if="pane.outlineOpen"
@@ -2207,6 +2297,8 @@ onBeforeUnmount(() => {
                           :document-path="pane.path"
                           :reveal-request="sourceRevealRequests[index] ?? undefined"
                           :annotations="annotationMarksByDocument[pane.path]"
+                          :search-matches="pane.searchMatches"
+                          :active-search-offset="pane.activeSearchOffset"
                           :readonly="!!lockSource(pane.path)"
                           :locale="locale"
                           class="min-w-0 flex-1"
@@ -2226,6 +2318,8 @@ onBeforeUnmount(() => {
                           :model-value="docs[pane.path]?.content ?? ''"
                           :document-path="pane.path"
                           :annotations="annotationMarksByDocument[pane.path]"
+                          :search-matches="pane.searchMatches"
+                          :active-search-offset="pane.activeSearchOffset"
                           :terms="termMarksByDocument[pane.path]"
                           :locale="locale"
                           :readonly="!!lockSource(pane.path)"
@@ -2405,7 +2499,7 @@ onBeforeUnmount(() => {
                 v-for="hit in hits"
                 :key="`${hit.path}:${hit.offset}`"
                 class="mt-3 block w-full rounded-lg p-2 text-left hover:bg-slate-50"
-                @click.stop="jumpTo(hit.path, hit.offset, query.length)"
+                @click.stop="jumpTo(hit.path, hit.offset, searchedQuery.length)"
               >
                 <div class="text-xs font-medium text-blue-600">
                   {{ hit.path }}

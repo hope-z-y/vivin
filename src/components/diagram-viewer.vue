@@ -21,17 +21,32 @@ onMounted(() => dialog.value?.showModal());
       <div class="diagram-toolbar">
         <span class="flex-1 font-medium">{{ locale === 'en' ? 'Diagram' : '图表' }}</span>
         <button
-          :disabled="zoom <= 0.5"
+          :disabled="zoom <= 0.1"
           :aria-label="locale === 'en' ? 'Zoom out' : '缩小'"
-          @click="zoom = Math.max(0.5, zoom - 0.25)"
+          @click="zoom = Math.max(0.1, Math.round((zoom - 0.1) * 100) / 100)"
         >
           <Minus :size="16" />
         </button>
-        <span class="w-12 text-center text-xs">{{ Math.round(zoom * 100) }}%</span>
+        <input
+          class="w-16 text-center text-xs"
+          type="number"
+          min="10"
+          max="300"
+          step="10"
+          :value="Math.round(zoom * 100)"
+          :aria-label="locale === 'en' ? 'Zoom percent' : '缩放百分比'"
+          @change="
+            zoom = Math.max(
+              0.1,
+              Math.min(3, (Number(($event.target as HTMLInputElement).value) || 100) / 100),
+            )
+          "
+        />
+        <span>%</span>
         <button
           :disabled="zoom >= 3"
           :aria-label="locale === 'en' ? 'Zoom in' : '放大'"
-          @click="zoom = Math.min(3, zoom + 0.25)"
+          @click="zoom = Math.min(3, Math.round((zoom + 0.1) * 100) / 100)"
         >
           <Plus :size="16" />
         </button>

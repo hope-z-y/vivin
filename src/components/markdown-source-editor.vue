@@ -5,6 +5,7 @@ import { Decoration, EditorView, keymap, type DecorationSet } from '@codemirror/
 import { basicSetup } from 'codemirror';
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { AnnotationMark } from '../lib/annotation-anchor';
+import type { SearchRange } from '../lib/document-search';
 import { minimalDocumentChange } from '../lib/document-change';
 import { importImage, type AnnotationKind } from '../lib/project-api';
 
@@ -14,6 +15,8 @@ const props = defineProps<{
   readonly?: boolean;
   annotations?: AnnotationMark[];
   locale?: 'zh' | 'en';
+  searchMatches?: SearchRange[];
+  activeSearchOffset?: number;
   revealRequest?: { offset: number; length: number; token: number };
 }>();
 const emit = defineEmits<{
@@ -30,6 +33,7 @@ const ready = new Promise<void>((resolve) => {
   resolveReady = resolve;
 });
 const readonlyCompartment = new Compartment();
+const updateSearch = StateEffect.define<null>();
 const updateAnnotations = StateEffect.define<AnnotationMark[]>();
 
 async function insertImage(file: File, position: number) {
@@ -75,6 +79,39 @@ const annotationsField = StateField.define<DecorationSet>({
   provide: (field) => EditorView.decorations.from(field),
 });
 
+function searchDecorations(documentLength: number): DecorationSet {
+  return Decoration.set(
+    (props.searchMatches ?? [])
+      .filter((match) => match.length > 0 && match.offset + match.length <= documentLength)
+      .map((match) =>
+        Decoration.mark({
+          class:
+            match.offset === props.activeSearchOffset
+              ? 'vivin-search-match vivin-search-active'
+              : 'vivin-search-match',
+        }).range(match.offset, match.offset + match.length),
+      ),
+    true,
+  );
+}
+const searchField = StateField.define<DecorationSet>({
+  create: (state) => searchDecorations(state.doc.length),
+  update(value, transaction) {
+    if (transaction.effects.some((effect) => effect.is(updateSearch))) {
+      return searchDecorations(transaction.state.doc.length);
+    }
+    return value.map(transaction.changes);
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+watch(
+  () => [props.searchMatches, props.activeSearchOffset],
+  () => {
+    editor?.dispatch({ effects: updateSearch.of(null) });
+  },
+  { flush: 'post' },
+);
+
 onMounted(() => {
   if (!container.value) {
     resolveReady();
@@ -90,6 +127,7 @@ onMounted(() => {
         EditorView.lineWrapping,
         readonlyCompartment.of(EditorView.editable.of(!props.readonly)),
         annotationsField,
+        searchField,
         EditorView.domEventHandlers({
           paste(event, view) {
             if (props.readonly) return false;
@@ -176,17 +214,17 @@ onBeforeUnmount(() => {
   editor = undefined;
 });
 
-async function reveal(offset: number, length = 0) {
+async function reveal(offset: number, length = 0, focus = true) {
   await ready;
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
   if (!editor) return;
   const anchor = Math.max(0, Math.min(offset, editor.state.doc.length));
   const head = Math.max(anchor, Math.min(anchor + length, editor.state.doc.length));
   editor.dispatch({
-    selection: { anchor, head },
+    ...(focus ? { selection: { anchor, head } } : {}),
     effects: EditorView.scrollIntoView(anchor, { y: 'center' }),
   });
-  editor.focus();
+  if (focus) editor.focus();
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
   if (!editor) return;
   // CodeMirror and the surrounding pane can both be scroll containers, depending
@@ -208,7 +246,18 @@ function selectedText(): { quote: string; offset: number } | null {
   };
 }
 
-defineExpose({ reveal, selectedText });
+function replaceMatches(matches: SearchRange[], replacement: string) {
+  if (!editor || props.readonly) return;
+  editor.dispatch({
+    changes: matches.map((match) => ({
+      from: match.offset,
+      to: match.offset + match.length,
+      insert: replacement,
+    })),
+  });
+}
+
+defineExpose({ reveal, selectedText, replaceMatches, focus: () => editor?.focus() });
 </script>
 
 <template>

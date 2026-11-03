@@ -16,6 +16,9 @@ const originals = {
       { length: 40 },
       (_, i) => `## 第 ${i + 3} 节\n\n段落内容，用于滚动位置回归。\n\n`,
     ).join(''),
+  '锁定.md': '# 锁定文件\n\n锁定正文 cat cat。\n',
+  '定位回归.md':
+    '[重复](重复)\n\n重复\n\n跨段\n\n锚点\n\n```mermaid\nflowchart LR\n  A[开始] --> B[结束]\n```\n',
   '特殊语法.md':
     '---\ntitle: 特殊语法\n---\n\n# 保留语法\n\n正文 **可以编辑**。\n\n<div>原始 HTML</div>\n\n[参考链接][ref] 与脚注[^note]。\n\n[ref]: https://example.com\n\n[^note]: 脚注正文\n',
   '长文.md':
@@ -29,10 +32,25 @@ const documents = structuredClone(originals);
 let data = {
   schemaVersion: 1,
   pinned: [],
-  locked: [],
+  locked: ['锁定.md'],
   terms: [],
   termExceptions: [],
   annotations: [
+    ...['重复', '跨段\n\n锚点'].map((anchorQuote, index) => ({
+      id: `navigation-${index}`,
+      document: '定位回归.md',
+      kind: 'comment',
+      quote: anchorQuote,
+      offset: originals['定位回归.md'].lastIndexOf(anchorQuote),
+      contextBefore: originals['定位回归.md'].slice(
+        0,
+        originals['定位回归.md'].lastIndexOf(anchorQuote),
+      ),
+      contextAfter: originals['定位回归.md'].slice(
+        originals['定位回归.md'].lastIndexOf(anchorQuote) + anchorQuote.length,
+      ),
+      note: '定位回归',
+    })),
     {
       id: 'note-1',
       document: '普通.md',
@@ -68,10 +86,30 @@ mockIPC(
         kind: 'document',
         children: [],
         pinned: false,
-        lockSource: null,
+        lockSource: data.locked.includes(path) ? path : null,
       }));
     if (command === 'list_resources') return [];
     if (command === 'get_project_data') return structuredClone(data);
+    if (command === 'search_documents') {
+      const term = args.query.trim();
+      return term
+        ? Object.entries(documents).flatMap(([path, text]) => {
+            const hits = [];
+            let from = 0;
+            while (from < text.length) {
+              const offset = text.indexOf(term, from);
+              if (offset < 0) break;
+              hits.push({
+                path,
+                offset,
+                excerpt: text.slice(Math.max(0, offset - 40), offset + term.length + 40),
+              });
+              from = offset + term.length;
+            }
+            return hits;
+          })
+        : [];
+    }
     if (command === 'read_document' || command === 'reload_document')
       return { path: args.path, content: documents[args.path], revision: String(revision) };
     if (command === 'read_document_revision') return String(revision);

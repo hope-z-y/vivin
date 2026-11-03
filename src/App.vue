@@ -1528,6 +1528,17 @@ function clampSidebarOnWindowResize() {
   sidebarWidth.value = clampSidebarWidth(sidebarWidth.value);
 }
 function shortcut(event: KeyboardEvent) {
+  // Leave macOS's native Control-Command-F fullscreen shortcut to the system.
+  if (
+    platform.value === 'macos' &&
+    event.ctrlKey &&
+    event.metaKey &&
+    event.key.toLowerCase() === 'f'
+  )
+    return;
+  if (event.key === 'Escape' && platform.value === 'macos') {
+    event.preventDefault();
+  }
   if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'f') {
     event.preventDefault();
     const path = panes.value[activePane.value]?.path;
@@ -1535,6 +1546,8 @@ function shortcut(event: KeyboardEvent) {
     return;
   }
   if (event.key === 'Escape' && dialog.value) {
+    event.preventDefault();
+    event.stopPropagation();
     finishDialog(false);
     return;
   }
@@ -1548,7 +1561,15 @@ function shortcut(event: KeyboardEvent) {
     void openFind();
     return;
   }
-  if (event.key === 'Escape' && document.querySelector('dialog[open]')) return;
+  if (event.key === 'Escape') {
+    const modal = document.querySelector<HTMLDialogElement>('dialog[open]');
+    if (modal) {
+      event.preventDefault();
+      event.stopPropagation();
+      modal.close();
+      return;
+    }
+  }
   if (event.key === 'Escape' && panes.value[activePane.value]?.findOpen) {
     event.preventDefault();
     event.stopPropagation();
@@ -1697,7 +1718,7 @@ onBeforeUnmount(() => {
   <div
     :class="[
       'app-shell flex flex-col overflow-hidden bg-[#f3f6fa] text-slate-900',
-      windowExpanded
+      windowExpanded || platform === 'macos'
         ? 'h-screen rounded-none'
         : 'm-2 h-[calc(100vh-16px)] rounded-xl shadow-[0_4px_14px_-3px_rgb(15_23_42_/_18%)]',
       theme === 'dark' ? 'theme-dark' : '',
@@ -1709,7 +1730,12 @@ onBeforeUnmount(() => {
       more = false;
     "
   >
-    <AppTitlebar :sidebar-open="sidebar" :sidebar-width="sidebarWidth" :locale="locale">
+    <AppTitlebar
+      :sidebar-open="sidebar"
+      :sidebar-width="sidebarWidth"
+      :platform="platform"
+      :locale="locale"
+    >
       <template #sidebar-control>
         <button
           class="rounded-md p-1.5 text-slate-600 hover:bg-slate-200/70"
@@ -2770,24 +2796,38 @@ onBeforeUnmount(() => {
       @mouseleave="scheduleHideAnnotationPopover"
       @click.stop
     >
-      <div class="flex shrink-0 justify-end gap-1 px-1 pt-1">
-        <button
-          v-if="!annotationEditing"
-          class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100"
-          :title="translate('编辑说明', 'Edit note')"
-          :aria-label="translate('编辑说明', 'Edit note')"
-          @click.stop="startAnnotationEdit"
+      <div class="flex shrink-0 items-center justify-between gap-3 px-2 pt-1">
+        <span
+          class="inline-flex items-center gap-1.5 rounded-md bg-slate-50 px-2 py-1 text-xs font-medium text-slate-600"
         >
-          <Pencil :size="15" />
-        </button>
-        <button
-          class="rounded-md p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
-          :title="translate('删除标注', 'Delete annotation')"
-          :aria-label="translate('删除标注', 'Delete annotation')"
-          @click.stop="removeAnnotation(selectedAnnotation!)"
-        >
-          <Trash2 :size="15" />
-        </button>
+          <span
+            aria-hidden="true"
+            class="h-1.5 w-1.5 shrink-0 rounded-full"
+            :style="{
+              background: kinds.find((kind) => kind.value === selectedAnnotation?.kind)?.color,
+            }"
+          />
+          {{ kindLabel(selectedAnnotation.kind) }}
+        </span>
+        <div class="flex shrink-0 gap-1">
+          <button
+            v-if="!annotationEditing"
+            class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100"
+            :title="translate('编辑说明', 'Edit note')"
+            :aria-label="translate('编辑说明', 'Edit note')"
+            @click.stop="startAnnotationEdit"
+          >
+            <Pencil :size="15" />
+          </button>
+          <button
+            class="rounded-md p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+            :title="translate('删除标注', 'Delete annotation')"
+            :aria-label="translate('删除标注', 'Delete annotation')"
+            @click.stop="removeAnnotation(selectedAnnotation!)"
+          >
+            <Trash2 :size="15" />
+          </button>
+        </div>
       </div>
       <div v-if="!annotationEditing" class="min-h-0 overflow-auto">
         <AnnotationMarkdown

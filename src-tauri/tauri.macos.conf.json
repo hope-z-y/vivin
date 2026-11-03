@@ -3,14 +3,20 @@
     "windows": [
       {
         "title": "vivin",
-        "decorations": false,
-        "transparent": true,
-        "shadow": false,
+        "decorations": true,
+        "transparent": false,
+        "shadow": true,
         "dragDropEnabled": false,
         "width": 1280,
         "height": 800,
         "minWidth": 900,
-        "minHeight": 600
+        "minHeight": 600,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 20,
+          "y": 20
+        }
       }
     ]
   }

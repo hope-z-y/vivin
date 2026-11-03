@@ -3,21 +3,16 @@ import { isTauri } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Minus, Square, X } from '@lucide/vue';
 
-const isMac = navigator.userAgent.includes('Macintosh');
-// Use clickable app controls in the undecorated macOS window.
-const nativeMacControls = false;
-defineProps<{ sidebarOpen: boolean; sidebarWidth: number; locale?: 'zh' | 'en' }>();
+defineProps<{
+  sidebarOpen: boolean;
+  sidebarWidth: number;
+  platform: 'macos' | 'windows' | 'linux';
+  locale?: 'zh' | 'en';
+}>();
 
 async function runWindowAction(action: 'close' | 'minimize' | 'toggleMaximize') {
   if (!isTauri()) return;
   await getCurrentWindow()[action]();
-}
-
-async function toggleWindowSize() {
-  if (!isTauri()) return;
-  const currentWindow = getCurrentWindow();
-  if (isMac) await currentWindow.setFullscreen(!(await currentWindow.isFullscreen()));
-  else await currentWindow.toggleMaximize();
 }
 </script>
 
@@ -26,7 +21,7 @@ async function toggleWindowSize() {
     <div
       :class="[
         'flex h-full shrink-0 items-center px-4',
-        nativeMacControls
+        platform === 'macos'
           ? sidebarOpen
             ? 'w-64 justify-end'
             : 'w-36 justify-end'
@@ -37,32 +32,6 @@ async function toggleWindowSize() {
       :style="sidebarOpen ? { width: `${sidebarWidth}px` } : undefined"
       data-tauri-drag-region
     >
-      <div v-if="isMac && !nativeMacControls" class="flex items-center gap-2">
-        <button
-          :aria-label="locale === 'en' ? 'Close window' : '关闭窗口'"
-          :title="locale === 'en' ? 'Close window' : '关闭窗口'"
-          class="h-3 w-3 rounded-full bg-[#ff5f57]"
-          type="button"
-          @mousedown.stop
-          @click.stop="runWindowAction('close')"
-        />
-        <button
-          :aria-label="locale === 'en' ? 'Minimize window' : '最小化窗口'"
-          :title="locale === 'en' ? 'Minimize window' : '最小化窗口'"
-          class="h-3 w-3 rounded-full bg-[#febc2e]"
-          type="button"
-          @mousedown.stop
-          @click.stop="runWindowAction('minimize')"
-        />
-        <button
-          :aria-label="locale === 'en' ? 'Toggle fullscreen' : '切换全屏'"
-          :title="locale === 'en' ? 'Toggle fullscreen' : '切换全屏'"
-          class="h-3 w-3 rounded-full bg-[#28c840]"
-          type="button"
-          @mousedown.stop
-          @click.stop="toggleWindowSize"
-        />
-      </div>
       <slot name="sidebar-control" />
     </div>
 
@@ -70,7 +39,7 @@ async function toggleWindowSize() {
       <slot />
     </div>
 
-    <div v-if="!isMac" class="flex h-full items-center">
+    <div v-if="platform !== 'macos'" class="flex h-full items-center">
       <button
         :aria-label="locale === 'en' ? 'Minimize window' : '最小化窗口'"
         :title="locale === 'en' ? 'Minimize window' : '最小化窗口'"

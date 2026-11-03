@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, X } from '@lucide/vue';
-import { computed, nextTick, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { findDocumentMatches, type SearchRange } from '../lib/document-search';
 
 const props = defineProps<{
@@ -15,6 +15,47 @@ const emit = defineEmits<{
   close: [];
 }>();
 const input = ref<HTMLInputElement>();
+const anchor = ref<HTMLDivElement>();
+const placement = ref({ left: '0px', top: '0px', width: '0px' });
+let resizeObserver: ResizeObserver | undefined;
+let placementFrame = 0;
+function updatePlacement() {
+  if (placementFrame) return;
+  placementFrame = requestAnimationFrame(() => {
+    placementFrame = 0;
+    const bounds = anchor.value?.getBoundingClientRect();
+    if (!bounds) return;
+    const right = Math.min(bounds.right, window.innerWidth) - 8;
+    const left = Math.max(8, bounds.left + 8, right - 560);
+    const top = Math.max(8, bounds.top + 8);
+    const next = { left: `${left}px`, top: `${top}px`, width: `${Math.max(0, right - left)}px` };
+    if (
+      next.left !== placement.value.left ||
+      next.top !== placement.value.top ||
+      next.width !== placement.value.width
+    ) {
+      placement.value = next;
+    }
+  });
+}
+onMounted(() => {
+  resizeObserver = new ResizeObserver(updatePlacement);
+  if (anchor.value) {
+    resizeObserver.observe(anchor.value);
+    if (anchor.value.parentElement) resizeObserver.observe(anchor.value.parentElement);
+    if (anchor.value.previousElementSibling)
+      resizeObserver.observe(anchor.value.previousElementSibling);
+  }
+  window.addEventListener('resize', updatePlacement);
+  window.addEventListener('scroll', updatePlacement, true);
+  updatePlacement();
+});
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect();
+  cancelAnimationFrame(placementFrame);
+  window.removeEventListener('resize', updatePlacement);
+  window.removeEventListener('scroll', updatePlacement, true);
+});
 const query = ref('');
 const replacement = ref('');
 const replaceOpen = ref(false);
@@ -70,86 +111,115 @@ defineExpose({ focus });
 </script>
 
 <template>
-  <div
-    class="document-find border-b border-slate-200 bg-white p-2 text-xs"
-    role="search"
-    :aria-label="t('文件内搜索', 'Find in file')"
-    @keydown.esc.stop.prevent="emit('close')"
-  >
-    <div class="flex items-center gap-1">
-      <button
-        :title="t('展开替换', 'Toggle replace')"
-        :aria-expanded="replaceOpen"
-        @click="replaceOpen = !replaceOpen"
-      >
-        <component :is="replaceOpen ? ChevronDown : ChevronRight" :size="15" />
-      </button>
-      <input
-        ref="input"
-        v-model="query"
-        class="min-w-0 flex-1 rounded border border-slate-200 bg-transparent px-2 py-1"
-        :placeholder="t('查找', 'Find')"
-        :aria-label="t('文件内查找', 'Find in file')"
-        @keydown.enter.stop.prevent="navigate($event.shiftKey ? -1 : 1)"
-      />
-      <button
-        :aria-pressed="caseSensitive"
-        :title="t('区分大小写', 'Match case')"
-        @click="caseSensitive = !caseSensitive"
-      >
-        Aa
-      </button>
-      <button
-        :aria-pressed="wholeWord"
-        :title="t('全字匹配', 'Match whole word')"
-        @click="wholeWord = !wholeWord"
-      >
-        ab
-      </button>
-      <span class="shrink-0 px-1" role="status">{{
-        matches.length ? `${active + 1}/${matches.length}` : t('无结果', 'No results')
-      }}</span>
-      <button
-        :disabled="!matches.length"
-        :aria-label="t('上一个匹配', 'Previous match')"
-        @click="navigate(-1)"
-      >
-        <ArrowUp :size="15" />
-      </button>
-      <button
-        :disabled="!matches.length"
-        :aria-label="t('下一个匹配', 'Next match')"
-        @click="navigate(1)"
-      >
-        <ArrowDown :size="15" />
-      </button>
-      <button :aria-label="t('关闭文件搜索', 'Close find')" @click="emit('close')">
-        <X :size="15" />
-      </button>
+  <div ref="anchor" class="document-find-anchor">
+    <div
+      class="document-find fixed z-40 rounded-lg border border-slate-200 bg-white p-2 text-xs shadow-lg"
+      :style="placement"
+      role="search"
+      :aria-label="t('文件内搜索', 'Find in file')"
+      @keydown.esc.stop.prevent="emit('close')"
+    >
+      <div class="document-find-row">
+        <button
+          :title="t('展开替换', 'Toggle replace')"
+          :aria-expanded="replaceOpen"
+          @click="replaceOpen = !replaceOpen"
+        >
+          <component :is="replaceOpen ? ChevronDown : ChevronRight" :size="15" />
+        </button>
+        <input
+          ref="input"
+          v-model="query"
+          class="min-w-0 flex-1 rounded border border-slate-200 bg-transparent px-2 py-1"
+          :placeholder="t('查找', 'Find')"
+          :aria-label="t('文件内查找', 'Find in file')"
+          @keydown.enter.stop.prevent="navigate($event.shiftKey ? -1 : 1)"
+        />
+        <div class="document-find-actions flex items-center gap-1">
+          <button
+            :aria-pressed="caseSensitive"
+            :title="t('区分大小写', 'Match case')"
+            @click="caseSensitive = !caseSensitive"
+          >
+            Aa
+          </button>
+          <button
+            :aria-pressed="wholeWord"
+            :title="t('全字匹配', 'Match whole word')"
+            @click="wholeWord = !wholeWord"
+          >
+            ab
+          </button>
+          <span class="shrink-0 px-1" role="status">{{
+            matches.length ? `${active + 1}/${matches.length}` : t('无结果', 'No results')
+          }}</span>
+          <button
+            :disabled="!matches.length"
+            :aria-label="t('上一个匹配', 'Previous match')"
+            @click="navigate(-1)"
+          >
+            <ArrowUp :size="15" />
+          </button>
+          <button
+            :disabled="!matches.length"
+            :aria-label="t('下一个匹配', 'Next match')"
+            @click="navigate(1)"
+          >
+            <ArrowDown :size="15" />
+          </button>
+          <button :aria-label="t('关闭文件搜索', 'Close find')" @click="emit('close')">
+            <X :size="15" />
+          </button>
+        </div>
+      </div>
+      <div v-if="replaceOpen" class="document-find-row">
+        <span aria-hidden="true" />
+        <input
+          v-model="replacement"
+          :disabled="readonly"
+          class="min-w-0 flex-1 rounded border border-slate-200 bg-transparent px-2 py-1"
+          :placeholder="t('替换为', 'Replace')"
+          :aria-label="t('替换为', 'Replace with')"
+          @keydown.enter.stop.prevent="replace(false)"
+        />
+        <div class="document-find-actions flex items-center gap-1">
+          <button :disabled="readonly || !matches.length" @click="replace(false)">
+            {{ t('替换', 'Replace') }}
+          </button>
+          <button :disabled="readonly || !matches.length" @click="replace(true)">
+            {{ t('全部替换', 'Replace all') }}
+          </button>
+        </div>
+      </div>
+      <p v-if="readonly && replaceOpen" class="col-span-3 text-slate-500">
+        {{ t('文件已锁定，无法替换', 'File is locked; replacement is disabled') }}
+      </p>
     </div>
-    <div v-if="replaceOpen" class="mt-1 flex items-center gap-2 pl-5">
-      <input
-        v-model="replacement"
-        :disabled="readonly"
-        class="min-w-0 flex-1 rounded border border-slate-200 bg-transparent px-2 py-1"
-        :placeholder="t('替换为', 'Replace')"
-        :aria-label="t('替换为', 'Replace with')"
-        @keydown.enter.stop.prevent="replace(false)"
-      />
-      <button :disabled="readonly || !matches.length" @click="replace(false)">
-        {{ t('替换', 'Replace') }}
-      </button>
-      <button :disabled="readonly || !matches.length" @click="replace(true)">
-        {{ t('全部替换', 'Replace all') }}
-      </button>
-    </div>
-    <p v-if="readonly && replaceOpen" class="mt-1 text-slate-500">
-      {{ t('文件已锁定，无法替换', 'File is locked; replacement is disabled') }}
-    </p>
   </div>
 </template>
 
 <style>
+.document-find-anchor {
+  flex: none;
+  width: 100%;
+  height: 0;
+}
+.document-find {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) max-content;
+  align-items: center;
+  gap: 4px;
+}
+.document-find-row {
+  display: contents;
+}
+.document-find-actions {
+  white-space: nowrap;
+}
+.document-find input {
+  width: 100%;
+}
+
 .document-find button {
   padding: 3px;
   border-radius: 4px;

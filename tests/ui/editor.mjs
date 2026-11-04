@@ -36,6 +36,16 @@ let data = {
   terms: [],
   termExceptions: [],
   annotations: [
+    {
+      id: 'question-1',
+      document: '普通.md',
+      kind: 'question',
+      quote: '普通正文',
+      offset: markdown.indexOf('普通正文'),
+      contextBefore: ' 和',
+      contextAfter: '。',
+      note: '这是一条简短的疑问说明。',
+    },
     ...['重复', '跨段\n\n锚点'].map((anchorQuote, index) => ({
       id: `navigation-${index}`,
       document: '定位回归.md',
@@ -78,7 +88,12 @@ mockIPC(
   (command, args) => {
     if (command === 'get_platform')
       return new URLSearchParams(location.search).get('platform') ?? 'macos';
-    if (command === 'open_project') return { name: '验收项目', path: '/fixture' };
+    if (command === 'plugin:dialog|open') return '/fixture-other';
+    if (command === 'open_project')
+      return {
+        name: args.path === '/fixture-other' ? '另一个验收项目' : '验收项目',
+        path: args.path,
+      };
     if (command === 'list_project_tree')
       return Object.keys(documents).map((path) => ({
         name: path,

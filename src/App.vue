@@ -155,7 +155,7 @@ interface SourceRevealRequest {
 const kinds: { value: AnnotationKind; label: string; color: string }[] = [
   { value: 'todo', label: '待办', color: '#d69e16' },
   { value: 'comment', label: '批注', color: '#2f7bdd' },
-  { value: 'question', label: '疑问', color: '#8856cb' },
+  { value: 'question', label: '疑问', color: '#ea701b' },
   { value: 'error', label: '错误', color: '#e04c66' },
 ];
 const emptyData = (): ProjectData => ({
@@ -212,6 +212,7 @@ const annotationPopoverAt = ref({ x: 0, y: 0 });
 const annotationPopoverSize = ref({ width: 320, height: 240 });
 let annotationResizeObserver: ResizeObserver | undefined;
 const annotationEditing = ref(false);
+const annotationEditSize = ref({ width: 420, height: 320 });
 const annotationDraft = ref('');
 const annotationSaving = ref(false);
 const hoveredTerm = ref<{
@@ -1431,6 +1432,11 @@ function startAnnotationEdit() {
   if (!annotation) return;
   keepAnnotationPopover();
   annotationDraft.value = annotation.note;
+  const card = document.getElementById('vivin-annotation-popover');
+  annotationEditSize.value = {
+    width: Math.max(420, card?.offsetWidth ?? 0),
+    height: Math.max(320, card?.offsetHeight ?? 0),
+  };
   annotationEditing.value = true;
   void nextTick(() => document.getElementById('vivin-annotation-note')?.focus());
 }
@@ -1746,9 +1752,16 @@ onBeforeUnmount(() => {
         </button>
       </template>
       <div class="relative flex min-w-0 items-center gap-2">
-        <span class="min-w-0 truncate px-1.5 text-sm font-semibold" :title="project?.path">{{
-          project?.name || 'vivin'
-        }}</span>
+        <button
+          class="flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-sm font-semibold hover:bg-slate-200/70 disabled:opacity-50"
+          :title="project?.path"
+          :aria-label="translate('切换项目', 'Switch project')"
+          :disabled="busy"
+          @click.stop="switchProject(false)"
+        >
+          <span class="truncate">{{ project?.name || 'vivin' }}</span>
+          <ChevronDown :size="14" class="shrink-0 text-slate-500" />
+        </button>
         <LoaderCircle
           v-if="busy || refreshing"
           :size="15"
@@ -1756,7 +1769,7 @@ onBeforeUnmount(() => {
           :title="translate('正在加载项目', 'Loading project')"
         />
       </div>
-      <div class="flex shrink-0 items-center gap-1 text-slate-600">
+      <div class="flex shrink-0 items-center gap-1.5 text-slate-600">
         <div class="relative shrink-0">
           <button
             :title="translate('新建或打开项目', 'Create or open project')"
@@ -1826,6 +1839,43 @@ onBeforeUnmount(() => {
             <LoaderCircle v-if="saving" :size="17" class="animate-spin" />
             <Save v-else :size="17" />
           </button>
+        </template>
+        <label
+          class="flex items-center gap-1 rounded-md px-1.5 py-1 text-slate-600"
+          :title="translate('Markdown 主题', 'Markdown theme')"
+        >
+          <Palette :size="17" />
+          <select
+            v-model="documentTheme"
+            class="max-w-24 cursor-pointer border-0 bg-transparent text-xs outline-none focus:ring-0 focus-visible:bg-slate-200/70"
+            :aria-label="translate('Markdown 主题', 'Markdown theme')"
+          >
+            <option v-for="item in documentThemes" :key="item.value" :value="item.value">
+              {{ item.label }}
+            </option>
+          </select>
+        </label>
+        <button
+          class="rounded-md p-1.5 hover:bg-slate-200/70"
+          :title="translate('切换语言', 'Switch language')"
+          :aria-label="translate('切换语言', 'Switch language')"
+          @click.stop="locale = locale === 'zh' ? 'en' : 'zh'"
+        >
+          <Languages :size="17" />
+        </button>
+        <button
+          class="rounded-md p-1.5 hover:bg-slate-200/70"
+          :title="
+            theme === 'dark'
+              ? translate('切换到浅色模式', 'Switch to light mode')
+              : translate('切换到深色模式', 'Switch to dark mode')
+          "
+          :aria-label="translate('切换明暗模式', 'Toggle appearance')"
+          @click.stop="theme = theme === 'dark' ? 'light' : 'dark'"
+        >
+          <Sun v-if="theme === 'dark'" :size="17" /><Moon v-else :size="17" />
+        </button>
+        <template v-if="project">
           <div class="relative">
             <button
               :title="translate('更多', 'More')"
@@ -1858,41 +1908,6 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </template>
-        <label
-          class="flex items-center gap-1 rounded-md px-1.5 py-1 text-slate-600"
-          :title="translate('Markdown 主题', 'Markdown theme')"
-        >
-          <Palette :size="17" />
-          <select
-            v-model="documentTheme"
-            class="max-w-24 cursor-pointer bg-transparent text-xs"
-            :aria-label="translate('Markdown 主题', 'Markdown theme')"
-          >
-            <option v-for="item in documentThemes" :key="item.value" :value="item.value">
-              {{ item.label }}
-            </option>
-          </select>
-        </label>
-        <button
-          class="rounded-md p-1.5 hover:bg-slate-200/70"
-          :title="translate('切换语言', 'Switch language')"
-          :aria-label="translate('切换语言', 'Switch language')"
-          @click.stop="locale = locale === 'zh' ? 'en' : 'zh'"
-        >
-          <Languages :size="17" />
-        </button>
-        <button
-          class="rounded-md p-1.5 hover:bg-slate-200/70"
-          :title="
-            theme === 'dark'
-              ? translate('切换到浅色模式', 'Switch to light mode')
-              : translate('切换到深色模式', 'Switch to dark mode')
-          "
-          :aria-label="translate('切换明暗模式', 'Toggle appearance')"
-          @click.stop="theme = theme === 'dark' ? 'light' : 'dark'"
-        >
-          <Sun v-if="theme === 'dark'" :size="17" /><Moon v-else :size="17" />
-        </button>
       </div>
     </AppTitlebar>
     <div class="flex min-h-0 flex-1">
@@ -2393,14 +2408,14 @@ onBeforeUnmount(() => {
                           )"
                           :key="mark.id"
                           :aria-label="`${kindLabel(mark.kind)}: ${mark.quote}`"
-                          class="group absolute left-1 flex h-5 w-6 -translate-y-1/2 items-center justify-center rounded hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500"
+                          class="annotation-minimap-mark group absolute left-1 flex h-5 w-6 -translate-y-1/2 items-center justify-center focus-visible:outline-2 focus-visible:outline-blue-500"
                           :style="{
                             top: `${Math.max(12, Math.min(95, (100 * mark.offset) / Math.max(1, docs[pane.path]?.content.length ?? 1)))}%`,
                           }"
                           @click.stop="jumpTo(pane.path, mark.offset, mark.length, mark.id)"
                         >
                           <span
-                            class="h-[3px] w-3.5 rounded-full transition-all group-hover:w-5"
+                            class="h-[3px] w-3.5 rounded-full transition-[width] group-hover:w-5 group-focus-visible:w-5"
                             :style="{
                               background: kinds.find((kind) => kind.value === mark.kind)?.color,
                             }"
@@ -2787,6 +2802,8 @@ onBeforeUnmount(() => {
       :style="{
         left: `${annotationPopoverAt.x}px`,
         top: `${annotationPopoverAt.y}px`,
+        width: annotationEditing ? `${annotationEditSize.width}px` : undefined,
+        height: annotationEditing ? `${annotationEditSize.height}px` : undefined,
         maxWidth: `${annotationPopoverSize.width}px`,
         maxHeight: `${annotationPopoverSize.height}px`,
       }"
@@ -2840,16 +2857,16 @@ onBeforeUnmount(() => {
           @open-reference="openReference(selectedAnnotation!.document, $event)"
         />
       </div>
-      <div v-else class="min-h-0 overflow-auto p-3">
+      <div v-else class="flex min-h-0 flex-1 flex-col p-3">
         <textarea
           id="vivin-annotation-note"
           v-model="annotationDraft"
-          class="w-full resize-y rounded-lg bg-slate-50 p-2 text-sm leading-5 outline-none focus:ring-2 focus:ring-blue-200"
-          rows="3"
+          class="min-h-0 w-full flex-1 resize-none rounded-lg bg-slate-50 p-3 text-sm leading-6 outline-none focus:ring-2 focus:ring-blue-200"
+          rows="10"
           :aria-label="translate('标注说明', 'Annotation note')"
           @keydown.esc.stop="annotationEditing = false"
         />
-        <div class="mt-2 flex justify-end gap-2 text-xs">
+        <div class="mt-2 flex shrink-0 justify-end gap-2 text-xs">
           <button
             class="rounded-md px-2.5 py-1.5 text-slate-500 hover:bg-slate-100"
             @click.stop="annotationEditing = false"
